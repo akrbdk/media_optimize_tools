@@ -1,6 +1,7 @@
 # Folder Stats Helper
 
-`folder_stats.sh` is a minimal inspection tool: it walks a target directory, prints cumulative sizes for each subdirectory, and lists the largest files so you know where space is going before running any optimizers.
+`folder_stats.sh` is a minimal inspection tool: it walks a target directory, prints cumulative sizes for each
+subdirectory, and lists the largest files so you know where space is going before running any optimizers.
 
 ```
 ./tools/folder_stats.sh /mnt/usb/Photos --depth 3 --top-files 100
@@ -8,7 +9,8 @@
 
 ## What it shows
 
-1. `du -h` output sorted by size up to the requested depth (default depth 2). Useful to spot which subfolders deserve attention.
+1. `du -h` output sorted by size up to the requested depth (default depth 2). Useful to spot which subfolders deserve
+   attention.
 2. The largest files (default top 50) with human‑readable sizes, letting you quickly identify outliers.
 
 No files are modified; the script only reads metadata.
@@ -21,7 +23,8 @@ No files are modified; the script only reads metadata.
 
 ## Requirements
 
-The script relies on core utilities available on any Linux distro (`du`, `find`, `sort`, `awk`). No extra packages needed.
+The script relies on core utilities available on any Linux distro (`du`, `find`, `sort`, `awk`). No extra packages
+needed.
 
 ## Suggested Workflow
 

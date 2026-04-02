@@ -1,6 +1,7 @@
 # Copy & Optimize Media With Report
 
-`copy_optimize_media_with_report.sh` combines the image and video optimizers in one pass, copies the source directory, and prints a detailed before/after report so you can gauge the savings before importing into Google Notes/Keep.
+`copy_optimize_media_with_report.sh` combines the image and video optimizers in one pass, copies the source directory,
+and prints a detailed before/after report so you can gauge the savings before importing into Google Notes/Keep.
 
 ```
 ./tools/copy_optimize_media_with_report.sh SOURCE_DIR [DEST_DIR]
@@ -34,22 +35,22 @@ All the same environment variables remain available:
 
 ### Images
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `NOTES_MAX_DIM` | `2048` | Max width/height in pixels. |
-| `NOTES_JPEG_QUALITY` | `82` | JPEG/HEIC quality percentage. |
-| `NOTES_WEBP_QUALITY` | `80` | WEBP quality percentage. |
-| `NOTES_PNG_COMPRESSION` | `9` | PNG compression level (`0-9`). |
+| Variable                | Default | Meaning                        |
+|-------------------------|---------|--------------------------------|
+| `NOTES_MAX_DIM`         | `2048`  | Max width/height in pixels.    |
+| `NOTES_JPEG_QUALITY`    | `82`    | JPEG/HEIC quality percentage.  |
+| `NOTES_WEBP_QUALITY`    | `80`    | WEBP quality percentage.       |
+| `NOTES_PNG_COMPRESSION` | `9`     | PNG compression level (`0-9`). |
 
 ### Video
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `NOTES_VIDEO_MAX_WIDTH` | `1920` | Maximum width. |
-| `NOTES_VIDEO_MAX_HEIGHT` | `1080` | Maximum height. |
-| `NOTES_VIDEO_CRF` | `23` | libx264 CRF (lower = better quality). |
-| `NOTES_VIDEO_PRESET` | `medium` | libx264 speed/compression preset. |
-| `NOTES_VIDEO_AUDIO_BITRATE` | `128k` | AAC audio bitrate. |
+| Variable                    | Default  | Meaning                               |
+|-----------------------------|----------|---------------------------------------|
+| `NOTES_VIDEO_MAX_WIDTH`     | `1920`   | Maximum width.                        |
+| `NOTES_VIDEO_MAX_HEIGHT`    | `1080`   | Maximum height.                       |
+| `NOTES_VIDEO_CRF`           | `23`     | libx264 CRF (lower = better quality). |
+| `NOTES_VIDEO_PRESET`        | `medium` | libx264 speed/compression preset.     |
+| `NOTES_VIDEO_AUDIO_BITRATE` | `128k`   | AAC audio bitrate.                    |
 
 Example run with custom caps:
 
