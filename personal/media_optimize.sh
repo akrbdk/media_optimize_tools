@@ -175,16 +175,41 @@ ext_allowed() {
 # ── Image tool ────────────────────────────────────────────────────────────────
 # Stored as array to avoid word-split issues with paths containing spaces
 IMGCMD=()
+# HEIC_TOOL: "pillow" | "imagemagick"
+HEIC_TOOL=""
 init_image_tool() {
-    if command -v magick >/dev/null 2>&1; then
+    if command -v magick >/dev/null 2>&1 && magick -list format 2>/dev/null | grep -qi heic; then
         IMGCMD=(magick convert)
     elif command -v convert >/dev/null 2>&1 && convert --version 2>&1 | grep -qi imagemagick; then
         IMGCMD=(convert)
+    elif command -v magick >/dev/null 2>&1; then
+        IMGCMD=(magick convert)
     else
         fail "ImageMagick (magick or convert) is required for photo processing."
     fi
+
+    # Prefer pillow-heif for HEIC: handles files that libheif 1.17 cannot
+    if python3 -c "import pillow_heif" 2>/dev/null; then
+        HEIC_TOOL="pillow"
+    else
+        HEIC_TOOL="imagemagick"
+    fi
 }
 run_convert() { "${IMGCMD[@]}" "$@"; }
+
+# Convert one HEIC file to JPEG using pillow-heif (handles auxiliary image refs)
+heif_to_jpeg_pillow() {
+    local src="$1" dst="$2" quality="$3"
+    python3 -c "
+import sys, pillow_heif
+from PIL import Image
+pillow_heif.register_heif_opener()
+img = Image.open(sys.argv[1])
+if img.mode not in ('RGB', 'L'):
+    img = img.convert('RGB')
+img.save(sys.argv[2], format='JPEG', quality=int(sys.argv[3]), optimize=True)
+" "$src" "$dst" "$quality"
+}
 
 # ── Temp file cleanup ─────────────────────────────────────────────────────────
 STATS_DIR=""
@@ -247,7 +272,6 @@ optimize_photo() {
     local file="$1" rel="$2" stats_file="$3"
     local ext="${file##*.}"; ext="${ext,,}"
     local tmp="${file}.opt.${BASHPID}"
-    trap 'rm -f "$tmp"' EXIT
 
     local extra_args=()
     case "$ext" in
@@ -278,7 +302,6 @@ convert_heic() {
     local file="$1" rel="$2" stats_file="$3"
     local dst="${file%.*}.jpg"
     local tmp="${dst}.opt.${BASHPID}"
-    trap 'rm -f "$tmp"' EXIT
 
     if [[ -f "$dst" ]]; then
         printf 'heic|%s|0|0|skip\n' "$rel" > "$stats_file"
@@ -288,7 +311,14 @@ convert_heic() {
     local sz_before sz_after
     sz_before=$(stat -c%s -- "$file")
 
-    if run_convert -auto-orient -strip -quality "$JPEG_QUALITY" "$file" "$tmp" 2>/dev/null; then
+    local ok=0
+    if [[ "$HEIC_TOOL" == "pillow" ]]; then
+        heif_to_jpeg_pillow "$file" "$tmp" "$JPEG_QUALITY" 2>/dev/null && ok=1
+    else
+        run_convert -auto-orient -strip -quality "$JPEG_QUALITY" "$file" "$tmp" 2>/dev/null && ok=1
+    fi
+
+    if (( ok )); then
         sz_after=$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)
         if (( sz_after > 0 )); then
             mv "$tmp" "$dst"
@@ -297,6 +327,7 @@ convert_heic() {
             return
         fi
     fi
+    rm -f "$tmp"
     printf 'heic|%s|%d|%d|fail\n' "$rel" "$sz_before" "$sz_before" > "$stats_file"
 }
 
@@ -311,8 +342,6 @@ convert_video() {
     else
         dst="${file%.*}.mp4"; tmp="${dst}.opt.${BASHPID}.mp4"
     fi
-    trap 'rm -f "$tmp"' EXIT
-
     local scale="scale='if(gt(iw,${VIDEO_MAX_W}),${VIDEO_MAX_W},iw)':'if(gt(ih,${VIDEO_MAX_H}),${VIDEO_MAX_H},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
 
     # Suppress per-second stats when multiple videos run in parallel (output would interleave)
@@ -335,6 +364,7 @@ convert_video() {
             return
         fi
     fi
+    rm -f "$tmp"
     printf 'video|%s|%d|%d|fail\n' "$rel" "$sz_before" "$sz_before" > "$stats_file"
 }
 
@@ -344,10 +374,12 @@ print_top_savings() {
     local top=20
     local tmp_all
     tmp_all=$(mktemp)
-    trap 'rm -f "$tmp_all"' RETURN
 
     cat "$stats_dir"/*.result 2>/dev/null > "$tmp_all" || true
-    [[ -s "$tmp_all" ]] || return
+    if [[ ! -s "$tmp_all" ]]; then
+        rm -f "$tmp_all"
+        return
+    fi
 
     echo
     echo "Top $top files by bytes saved:"
@@ -364,6 +396,7 @@ print_top_savings() {
         (( printed >= top )) && break
     done < <(awk -F'|' '{saved=$3-$4; print saved"|"$0}' "$tmp_all" | sort -t'|' -k1,1nr | cut -d'|' -f2-)
     (( printed == 0 )) && echo "  No files were reduced in size."
+    rm -f "$tmp_all"
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -435,7 +468,7 @@ run_optimization() {
 
     # HEIC → JPEG
     if (( ${#heic_files[@]} > 0 )); then
-        printf '--- HEIC/HEIF → JPEG  (quality=%d) ---\n' "$JPEG_QUALITY"
+        printf -- '--- HEIC/HEIF → JPEG  (quality=%d) ---\n' "$JPEG_QUALITY"
         idx=0
         for file in "${heic_files[@]}"; do
             (( ++idx ))
@@ -451,7 +484,7 @@ run_optimization() {
 
     # Photos
     if (( ${#img_files[@]} > 0 )); then
-        printf '--- Photos  (quality=%d, max=%dpx) ---\n' "$JPEG_QUALITY" "$IMG_MAX_DIM"
+        printf -- '--- Photos  (quality=%d, max=%dpx) ---\n' "$JPEG_QUALITY" "$IMG_MAX_DIM"
         idx=0
         for file in "${img_files[@]}"; do
             (( ++idx ))
@@ -468,7 +501,7 @@ run_optimization() {
     # Videos
     local -a all_videos=("${video_primary[@]+"${video_primary[@]}"}" "${video_other[@]+"${video_other[@]}"}")
     if (( ${#all_videos[@]} > 0 )); then
-        printf '--- Videos  (CRF=%d, preset=%s, max %dx%d, audio=%s) ---\n' \
+        printf -- '--- Videos  (CRF=%d, preset=%s, max %dx%d, audio=%s) ---\n' \
             "$VIDEO_CRF" "$VIDEO_PRESET" "$VIDEO_MAX_W" "$VIDEO_MAX_H" "$AUDIO_BITRATE"
         idx=0
         for file in "${all_videos[@]}"; do
@@ -677,10 +710,17 @@ main() {
         *) fail "--preset must be: ultrafast superfast veryfast faster fast medium slow slower veryslow" ;;
     esac
 
-    local source_dir="${positional[0]}"
+    local source_dir dest_dir
+    if (( skip_copy )) && [[ ${#positional[@]} -eq 1 ]]; then
+        # --skip-copy with one arg: that arg IS the directory to optimize in-place
+        source_dir="${positional[0]}"
+        dest_dir="${positional[0]}"
+    else
+        source_dir="${positional[0]}"
+        dest_dir="${positional[1]:-}"
+        [[ -z "$dest_dir" ]] && dest_dir="${source_dir%/}_optimized"
+    fi
     [[ -d "$source_dir" ]] || fail "Source directory '$source_dir' does not exist"
-    local dest_dir="${positional[1]:-}"
-    [[ -z "$dest_dir" ]] && dest_dir="${source_dir%/}_optimized"
 
     require_command python3
 

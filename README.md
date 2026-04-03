@@ -2,10 +2,10 @@
 
 ## What's in this repository
 
-| Command | Script | What it does |
-|---|---|---|
+| Command    | Script                       | What it does                                                                                      |
+|------------|------------------------------|---------------------------------------------------------------------------------------------------|
 | `optimize` | `personal/media_optimize.sh` | Copies a folder and optimizes the copy. Levels: `archive` / `moderate` / `aggressive` / `maximum` |
-| `stats` | `statistics/folder_stats.sh` | Disk statistics: folder sizes and largest files |
+| `stats`    | `statistics/folder_stats.sh` | Disk statistics: folder sizes and largest files                                                   |
 
 All commands are run via `./run.sh <command>`.
 
@@ -16,6 +16,7 @@ All commands are run via `./run.sh <command>`.
 Makes an rsync copy of SOURCE_DIR and optimizes it. The original is never touched.
 
 **Formats:**
+
 - HEIC/HEIF → JPEG (always — ~50–70% savings, opens everywhere)
 - MOV → MP4 H.264 + AAC (always — plays everywhere)
 - JPEG, WEBP → recompressed (strip EXIF, slight quality reduction)
@@ -24,12 +25,12 @@ Makes an rsync copy of SOURCE_DIR and optimizes it. The original is never touche
 
 ### Levels
 
-| | `archive` | `moderate` (default) | `aggressive` | `maximum` |
-|---|---|---|---|---|
-| JPEG quality | 95 | 88 | 80 | 70 |
-| Max photo size | no limit | 8000px | 3840px | 2560px |
-| MOV → MP4 | CRF 18, 4K slow | CRF 23, 4K | CRF 26, 1080p | CRF 28, 720p |
-| MP4/MKV/AVI | skip | skip | re-encode CRF 26, 1080p | re-encode CRF 28, 720p |
+|                | `archive`       | `moderate` (default) | `aggressive`            | `maximum`              |
+|----------------|-----------------|----------------------|-------------------------|------------------------|
+| JPEG quality   | 95              | 88                   | 80                      | 70                     |
+| Max photo size | no limit        | 8000px               | 3840px                  | 2560px                 |
+| MOV → MP4      | CRF 18, 4K slow | CRF 23, 4K           | CRF 26, 1080p           | CRF 28, 720p           |
+| MP4/MKV/AVI    | skip            | skip                 | re-encode CRF 26, 1080p | re-encode CRF 28, 720p |
 
 ### Examples
 
@@ -93,18 +94,38 @@ Useful to run before `optimize` to understand what's taking up space.
 ./run.sh stats --log ~/stats.log /media/usb
 ```
 
-| Option | Default | Env override |
-|---|---|---|
-| `--depth N` | `2` | `FOLDER_STATS_DEPTH` |
-| `--top-files K` | `50` | `FOLDER_STATS_TOP_FILES` |
-| `--log FILE` | off | — |
+| Option          | Default | Env override             |
+|-----------------|---------|--------------------------|
+| `--depth N`     | `2`     | `FOLDER_STATS_DEPTH`     |
+| `--top-files K` | `50`    | `FOLDER_STATS_TOP_FILES` |
+| `--log FILE`    | off     | —                        |
 
 ---
 
 ## Dependencies
 
 ```bash
-sudo apt install rsync python3 imagemagick libheif-examples ffmpeg
+sudo apt install rsync python3 imagemagick ffmpeg
+python3 -m pip install pillow-heif --break-system-packages
+```
+
+| Tool          | Used for                                               |
+|---------------|--------------------------------------------------------|
+| `rsync`       | Copying source → destination                           |
+| `python3`     | Dry-run size estimates                                 |
+| `pillow-heif` | HEIC→JPEG conversion (handles all iPhone HEIC variants)|
+| `imagemagick` | JPEG/PNG/WEBP photo optimization                       |
+| `ffmpeg`      | MOV→MP4 conversion, video re-encoding                  |
+
+**Note on HEIC:** Ubuntu 24.04 ships with libheif 1.17.6 which fails on many iPhone HEIC files
+(`Too many auxiliary image references`). `pillow-heif` bundles a newer libheif and handles
+these files correctly. If `pillow-heif` is not installed, the script falls back to ImageMagick.
+
+**Note:** `ffmpeg` is only needed if your archive contains video files (MOV, MP4, MKV, etc.).
+If you only have photos, you can skip it and use `--only-exts jpg,jpeg,png,heic` to avoid the ffmpeg check:
+
+```bash
+./run.sh optimize --only-exts jpg,jpeg,png,heic /media/usb/Photos
 ```
 
 All scripts print elapsed time in the final report.
