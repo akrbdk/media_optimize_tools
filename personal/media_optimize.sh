@@ -41,15 +41,6 @@ readonly MAX_VIDEO_CRF=28      MAX_VIDEO_PRESET="medium"
 readonly MAX_VIDEO_MAX_W=1280  MAX_VIDEO_MAX_H=720    MAX_AUDIO_BITRATE="128k"
 readonly MAX_REENCODE_ALL_VIDEO=1
 
-# Estimated savings ratios per level (used only for dry-run estimates).
-# Format: HEIC→JPEG / JPEG+WEBP / PNG / MOV→MP4 / existing video (if re-encoded)
-# Positive = savings (smaller), negative = growth (larger).
-# These are typical values — actual results vary by content.
-readonly ARC_EST="−40%  −5%  −3%  +15%   skip"   # archive makes video files larger (higher quality)
-readonly MOD_EST="  0%  −12%  −5%  +30%   skip"
-readonly AGG_EST="+15%  −22%  −8%  +50%  +35%"
-readonly MAX_EST="+40%  −35%  −10%  +65%  +55%"
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 usage() {
     cat <<'EOF'
@@ -62,8 +53,9 @@ Options:
   --level LEVEL                Level of optimization (default: moderate)
   --only-exts EXT[,EXT,...]   Process only these extensions, e.g. heic,mov,jpg
   --dry-run                   Show estimated savings per type, make no changes
+  --skip-copy                 Skip rsync step; optimize an already-copied directory
   --log FILE                  Append all output to FILE and terminal
-  --jobs N                    Parallel workers for photo/HEIC processing (default: 1)
+  --jobs N                    Parallel workers for photo/HEIC/video processing (default: 1)
   -h, --help                  Show this help
 
 Levels (--level):
@@ -104,36 +96,32 @@ Examples:
   media_optimize.sh --only-exts heic,mov /media/usb/Photos
   media_optimize.sh --level archive --only-exts heic /media/usb/Photos
   media_optimize.sh --log ~/opt.log --jobs 4 /media/usb/Photos
+  media_optimize.sh --skip-copy --level aggressive /media/usb/Photos_optimized
 EOF
 }
 
 fail()            { echo "Error: $*" >&2; exit 1; }
 require_command() { command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but not found in PATH."; }
-abs_path()        { python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
+abs_path()        { realpath -m "$1"; }
 
+# Pure-awk formatting — no Python subprocess per call
 format_bytes() {
-    python3 - "$1" <<'PY'
-import sys
-value = int(sys.argv[1])
-sign = "-" if value < 0 else ""
-value = abs(value)
-v = float(value)
-for unit in ["B","KB","MB","GB","TB"]:
-    if v < 1024 or unit == "TB":
-        print(f"{sign}{int(v)} {unit}" if unit == "B" else f"{sign}{v:.1f} {unit}")
-        break
-    v /= 1024
-PY
+    awk -v v="$1" 'BEGIN{
+        s = (v < 0) ? "-" : ""; v = (v < 0) ? -v : v
+        u = "B"
+        if (v >= 1024) { v /= 1024; u = "KB" }
+        if (v >= 1024) { v /= 1024; u = "MB" }
+        if (v >= 1024) { v /= 1024; u = "GB" }
+        if (v >= 1024) { v /= 1024; u = "TB" }
+        if (u == "B") printf "%s%d %s\n", s, v, u
+        else          printf "%s%.1f %s\n", s, v, u
+    }'
 }
 
 format_percent() {
     local before="$1" after="$2"
     (( before == 0 )) && { echo "n/a"; return; }
-    python3 - "$before" "$after" <<'PY'
-import sys
-b, a = int(sys.argv[1]), int(sys.argv[2])
-print(f"{(b-a)/b*100:+.1f}%")
-PY
+    awk -v b="$before" -v a="$after" 'BEGIN{ printf "%+.1f%%\n", (b-a)/b*100 }'
 }
 
 format_elapsed() {
@@ -145,12 +133,25 @@ format_elapsed() {
 }
 
 check_free_space() {
-    local src="$1" dest_parent="$2"
+    local src="$1" dest_parent="$2" level="${3:-moderate}"
     local src_bytes free_bytes
     src_bytes=$(du -sb "$src" 2>/dev/null | cut -f1) || return 0
     free_bytes=$(df -B1 --output=avail "$dest_parent" 2>/dev/null | tail -1 | tr -d ' ') || return 0
-    if (( src_bytes > free_bytes )); then
-        echo "WARNING: Source ~$(format_bytes "$src_bytes") but only $(format_bytes "$free_bytes") free on destination." >&2
+
+    # Estimate output size based on level (conservative but realistic)
+    local ratio
+    case "$level" in
+        archive)    ratio=115 ;;  # HEIC→JPEG can grow; use 115% of source
+        moderate)   ratio=85  ;;
+        aggressive) ratio=60  ;;
+        maximum)    ratio=45  ;;
+        *)          ratio=85  ;;
+    esac
+    local est_bytes
+    est_bytes=$(awk -v s="$src_bytes" -v r="$ratio" 'BEGIN{ printf "%d\n", s*r/100 }')
+
+    if (( est_bytes > free_bytes )); then
+        echo "WARNING: Estimated output ~$(format_bytes "$est_bytes") but only $(format_bytes "$free_bytes") free on destination." >&2
         printf 'Continue anyway? [y/N] ' >&2
         local reply; read -r reply </dev/tty || reply=n
         [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted." >&2; exit 1; }
@@ -171,37 +172,26 @@ ext_allowed() {
     return 1
 }
 
-# Filter an array in-place by allowed extensions (nameref, bash 4.3+)
-filter_by_ext() {
-    local -n _arr="$1"
-    local -a _filtered=()
-    local _f _ext
-    for _f in "${_arr[@]+"${_arr[@]}"}"; do
-        _ext="${_f##*.}"
-        ext_allowed "$_ext" && _filtered+=("$_f")
-    done
-    _arr=("${_filtered[@]+"${_filtered[@]}"}")
-}
-
 # ── Image tool ────────────────────────────────────────────────────────────────
-IMGCMD=""
+# Stored as array to avoid word-split issues with paths containing spaces
+IMGCMD=()
 init_image_tool() {
     if command -v magick >/dev/null 2>&1; then
-        IMGCMD="magick convert"
+        IMGCMD=(magick convert)
     elif command -v convert >/dev/null 2>&1 && convert --version 2>&1 | grep -qi imagemagick; then
-        IMGCMD="convert"
+        IMGCMD=(convert)
     else
         fail "ImageMagick (magick or convert) is required for photo processing."
     fi
 }
-run_convert() { $IMGCMD "$@"; }
+run_convert() { "${IMGCMD[@]}" "$@"; }
 
 # ── Temp file cleanup ─────────────────────────────────────────────────────────
 STATS_DIR=""
-CURRENT_TEMP=""
 cleanup() {
-    [[ -n "$CURRENT_TEMP" ]] && rm -f "$CURRENT_TEMP"
-    [[ -n "$STATS_DIR"    ]] && rm -rf "$STATS_DIR"
+    # Kill any still-running background jobs before exiting
+    jobs -rp 2>/dev/null | xargs -r kill 2>/dev/null || true
+    [[ -n "$STATS_DIR" ]] && rm -rf "$STATS_DIR"
 }
 trap cleanup EXIT INT TERM
 
@@ -211,6 +201,42 @@ wait_for_slot() {
     while (( $(jobs -rp | wc -l) >= PARALLEL_JOBS )); do
         wait -n 2>/dev/null || sleep 0.05
     done
+}
+
+# ── File collection ───────────────────────────────────────────────────────────
+# Single find pass — avoids re-reading the directory tree multiple times.
+# Sets globals (must be declared local -a by the caller):
+#   heic_files  heic_sizes   img_files  img_sizes
+#   video_primary  video_primary_sizes   video_other  video_other_sizes
+#   skipped_vid  skipped_vid_sizes
+#
+# Sizes are collected in the same pass, so no separate stat calls are needed.
+# with_skipped=1 → populate skipped_vid (videos not re-encoded at this level)
+collect_media_files() {
+    local dir="$1" with_skipped="${2:-0}"
+    local _sz _path _ext
+
+    printf 'Scanning %s ...\n' "$dir"
+
+    while IFS= read -r -d '' _sz && IFS= read -r -d '' _path; do
+        _ext="${_path##*.}"; _ext="${_ext,,}"
+        ext_allowed "$_ext" || continue
+        case "$_ext" in
+            heic|heif)
+                heic_files+=("$_path"); heic_sizes+=("$_sz") ;;
+            jpg|jpeg|png|webp)
+                img_files+=("$_path"); img_sizes+=("$_sz") ;;
+            mov)
+                video_primary+=("$_path"); video_primary_sizes+=("$_sz") ;;
+            mp4|mkv|avi|m4v|webm|mpg|mpeg)
+                if (( REENCODE_ALL_VIDEO )); then
+                    video_other+=("$_path"); video_other_sizes+=("$_sz")
+                elif (( with_skipped )); then
+                    skipped_vid+=("$_path"); skipped_vid_sizes+=("$_sz")
+                fi
+                ;;
+        esac
+    done < <(find "$dir" -type f -printf '%s\0%p\0')
 }
 
 # ── Per-file processors ───────────────────────────────────────────────────────
@@ -252,10 +278,9 @@ convert_heic() {
     local file="$1" rel="$2" stats_file="$3"
     local dst="${file%.*}.jpg"
     local tmp="${dst}.opt.${BASHPID}"
-    CURRENT_TEMP="$tmp"
+    trap 'rm -f "$tmp"' EXIT
 
     if [[ -f "$dst" ]]; then
-        CURRENT_TEMP=""
         printf 'heic|%s|0|0|skip\n' "$rel" > "$stats_file"
         return
     fi
@@ -268,13 +293,10 @@ convert_heic() {
         if (( sz_after > 0 )); then
             mv "$tmp" "$dst"
             rm -f "$file"
-            CURRENT_TEMP=""
             printf 'heic|%s|%d|%d\n' "$rel" "$sz_before" "$sz_after" > "$stats_file"
             return
         fi
     fi
-    rm -f "$tmp"
-    CURRENT_TEMP=""
     printf 'heic|%s|%d|%d|fail\n' "$rel" "$sz_before" "$sz_before" > "$stats_file"
 }
 
@@ -289,14 +311,18 @@ convert_video() {
     else
         dst="${file%.*}.mp4"; tmp="${dst}.opt.${BASHPID}.mp4"
     fi
-    CURRENT_TEMP="$tmp"
+    trap 'rm -f "$tmp"' EXIT
 
     local scale="scale='if(gt(iw,${VIDEO_MAX_W}),${VIDEO_MAX_W},iw)':'if(gt(ih,${VIDEO_MAX_H}),${VIDEO_MAX_H},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+    # Suppress per-second stats when multiple videos run in parallel (output would interleave)
+    local stats_flag="-stats"
+    (( PARALLEL_JOBS > 1 )) && stats_flag="-nostats"
 
     local sz_before sz_after
     sz_before=$(stat -c%s -- "$file")
 
-    if ffmpeg -hide_banner -loglevel warning -stats -y \
+    if ffmpeg -hide_banner -loglevel warning $stats_flag -y \
         -i "$file" -vf "$scale" \
         -c:v libx264 -preset "$VIDEO_PRESET" -crf "$VIDEO_CRF" \
         -pix_fmt yuv420p -movflags +faststart \
@@ -305,13 +331,10 @@ convert_video() {
         if (( sz_after > 0 )); then
             mv "$tmp" "$dst"
             [[ "$file" != "$dst" ]] && rm -f "$file"
-            CURRENT_TEMP=""
             printf 'video|%s|%d|%d\n' "$rel" "$sz_before" "$sz_after" > "$stats_file"
             return
         fi
     fi
-    rm -f "$tmp"
-    CURRENT_TEMP=""
     printf 'video|%s|%d|%d|fail\n' "$rel" "$sz_before" "$sz_before" > "$stats_file"
 }
 
@@ -321,8 +344,10 @@ print_top_savings() {
     local top=20
     local tmp_all
     tmp_all=$(mktemp)
+    trap 'rm -f "$tmp_all"' RETURN
+
     cat "$stats_dir"/*.result 2>/dev/null > "$tmp_all" || true
-    [[ -s "$tmp_all" ]] || { rm -f "$tmp_all"; return; }
+    [[ -s "$tmp_all" ]] || return
 
     echo
     echo "Top $top files by bytes saved:"
@@ -339,7 +364,6 @@ print_top_savings() {
         (( printed >= top )) && break
     done < <(awk -F'|' '{saved=$3-$4; print saved"|"$0}' "$tmp_all" | sort -t'|' -k1,1nr | cut -d'|' -f2-)
     (( printed == 0 )) && echo "  No files were reduced in size."
-    rm -f "$tmp_all"
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -376,11 +400,12 @@ print_summary() {
 
     echo
     echo "=== Optimization Summary ==="
-    printf '%-8s  %5d files  %12s → %12s  %s\n' \
+    # Only print rows that had actual files processed
+    (( heic_ok  > 0 || heic_fail  > 0 )) && printf '%-8s  %5d files  %12s → %12s  %s\n' \
         "HEIC"   "$heic_ok"  "$(format_bytes "$heic_before")"  "$(format_bytes "$heic_after")"  "$(format_percent "$heic_before"  "$heic_after")"
-    printf '%-8s  %5d files  %12s → %12s  %s\n' \
+    (( photo_ok > 0 || photo_fail > 0 )) && printf '%-8s  %5d files  %12s → %12s  %s\n' \
         "Photos" "$photo_ok" "$(format_bytes "$photo_before")" "$(format_bytes "$photo_after")" "$(format_percent "$photo_before" "$photo_after")"
-    printf '%-8s  %5d files  %12s → %12s  %s\n' \
+    (( video_ok > 0 || video_fail > 0 )) && printf '%-8s  %5d files  %12s → %12s  %s\n' \
         "Videos" "$video_ok" "$(format_bytes "$video_before")" "$(format_bytes "$video_after")" "$(format_percent "$video_before" "$video_after")"
     echo "──────────────────────────────────────────────────────────────────"
     printf '%-8s  %5d files  %12s → %12s  %s\n' \
@@ -397,20 +422,12 @@ run_optimization() {
     local dest="$1"
     local idx
 
-    local -a heic_files img_files video_primary video_other
-    mapfile -d '' -t heic_files    < <(find "$dest" -type f \( -iname '*.heic' -o -iname '*.heif' \) -print0)
-    mapfile -d '' -t img_files     < <(find "$dest" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) -print0)
-    mapfile -d '' -t video_primary < <(find "$dest" -type f -iname '*.mov' -print0)
-    if (( REENCODE_ALL_VIDEO )); then
-        mapfile -d '' -t video_other < <(find "$dest" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.avi' -o -iname '*.m4v' -o -iname '*.webm' -o -iname '*.mpg' -o -iname '*.mpeg' \) -print0)
-    else
-        video_other=()
-    fi
-
-    filter_by_ext heic_files
-    filter_by_ext img_files
-    filter_by_ext video_primary
-    filter_by_ext video_other
+    local -a heic_files=() heic_sizes=()
+    local -a img_files=() img_sizes=()
+    local -a video_primary=() video_primary_sizes=()
+    local -a video_other=() video_other_sizes=()
+    local -a skipped_vid=() skipped_vid_sizes=()
+    collect_media_files "$dest"
 
     printf 'Found: %d HEIC, %d photos, %d videos to process\n' \
         "${#heic_files[@]}" "${#img_files[@]}" "$(( ${#video_primary[@]} + ${#video_other[@]} ))"
@@ -460,71 +477,62 @@ run_optimization() {
             local sz; sz=$(stat -c%s -- "$file")
             printf '[%d/%d] %s  (%s)\n' "$idx" "${#all_videos[@]}" "$rel" "$(format_bytes "$sz")"
             local sf="$STATS_DIR/video_${idx}.result"
-            convert_video "$file" "$rel" "$sf"
-        done; echo
+            wait_for_slot
+            local _f="$file" _r="$rel" _sf="$sf"
+            { convert_video "$_f" "$_r" "$_sf"; } &
+        done
+        wait; echo
     fi
 }
 
 # ── Dry-run with estimated savings ────────────────────────────────────────────
-dry_run_estimate() {
-    # Compute estimated size after based on level ratios.
-    # Args: sz_total ratio_pct  (ratio_pct = expected savings 0-100, negative = grows)
-    python3 - "$1" "$2" <<'PY'
-import sys
-total = int(sys.argv[1])
-ratio = float(sys.argv[2])   # positive = savings %
-after = int(total * (1 - ratio / 100))
-print(after)
-PY
-}
-
 run_dry_run() {
     local src="$1"
     echo "DRY RUN — no files will be copied or modified."
     echo "Savings estimates are approximate (typical values, actual depends on content)."
     echo
 
-    local -a heic_files img_files video_primary video_other skipped_vid
-    mapfile -d '' -t heic_files    < <(find "$src" -type f \( -iname '*.heic' -o -iname '*.heif' \) -print0)
-    mapfile -d '' -t img_files     < <(find "$src" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) -print0)
-    mapfile -d '' -t video_primary < <(find "$src" -type f -iname '*.mov' -print0)
-    if (( REENCODE_ALL_VIDEO )); then
-        mapfile -d '' -t video_other < <(find "$src" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.avi' -o -iname '*.m4v' -o -iname '*.webm' -o -iname '*.mpg' -o -iname '*.mpeg' \) -print0)
-        skipped_vid=()
-    else
-        video_other=()
-        mapfile -d '' -t skipped_vid < <(find "$src" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.avi' \) -print0)
-    fi
+    local -a heic_files=() heic_sizes=()
+    local -a img_files=() img_sizes=()
+    local -a video_primary=() video_primary_sizes=()
+    local -a video_other=() video_other_sizes=()
+    local -a skipped_vid=() skipped_vid_sizes=()
+    collect_media_files "$src" 1
+    echo
 
-    filter_by_ext heic_files
-    filter_by_ext img_files
-    filter_by_ext video_primary
-    filter_by_ext video_other
-    filter_by_ext skipped_vid
-
-    # Estimated savings ratios (%) by level
+    # Estimated savings ratios (%) by level.
+    # Positive = savings (file gets smaller). Negative = growth (file gets larger).
     local heic_ratio img_ratio vid_ratio other_ratio
     case "$LEVEL" in
-        archive)    heic_ratio=-40; img_ratio=5;  vid_ratio=15;  other_ratio=0  ;;
-        moderate)   heic_ratio=0;   img_ratio=12; vid_ratio=30;  other_ratio=0  ;;
-        aggressive) heic_ratio=15;  img_ratio=22; vid_ratio=50;  other_ratio=35 ;;
-        maximum)    heic_ratio=40;  img_ratio=35; vid_ratio=65;  other_ratio=55 ;;
+        archive)    heic_ratio=-40; img_ratio=-5;  vid_ratio=15; other_ratio=0  ;;
+        moderate)   heic_ratio=0;   img_ratio=12;  vid_ratio=30; other_ratio=0  ;;
+        aggressive) heic_ratio=15;  img_ratio=22;  vid_ratio=50; other_ratio=35 ;;
+        maximum)    heic_ratio=40;  img_ratio=35;  vid_ratio=65; other_ratio=55 ;;
     esac
 
-    # Sum sizes per type
+    # Sum sizes from arrays collected during scan — no stat calls needed
     local heic_sz=0 img_sz=0 vid_sz=0 other_sz=0 skipped_sz=0
-    local f
-    for f in "${heic_files[@]+"${heic_files[@]}"}";    do heic_sz=$(( heic_sz + $(stat -c%s -- "$f") ));    done
-    for f in "${img_files[@]+"${img_files[@]}"}";      do img_sz=$(( img_sz + $(stat -c%s -- "$f") ));      done
-    for f in "${video_primary[@]+"${video_primary[@]}"}"; do vid_sz=$(( vid_sz + $(stat -c%s -- "$f") ));   done
-    for f in "${video_other[@]+"${video_other[@]}"}";  do other_sz=$(( other_sz + $(stat -c%s -- "$f") ));  done
-    for f in "${skipped_vid[@]+"${skipped_vid[@]}"}";  do skipped_sz=$(( skipped_sz + $(stat -c%s -- "$f") )); done
+    local _s
+    for _s in "${heic_sizes[@]+"${heic_sizes[@]}"}";          do (( heic_sz    += _s )); done
+    for _s in "${img_sizes[@]+"${img_sizes[@]}"}";            do (( img_sz     += _s )); done
+    for _s in "${video_primary_sizes[@]+"${video_primary_sizes[@]}"}"; do (( vid_sz += _s )); done
+    for _s in "${video_other_sizes[@]+"${video_other_sizes[@]}"}";  do (( other_sz  += _s )); done
+    for _s in "${skipped_vid_sizes[@]+"${skipped_vid_sizes[@]}"}";  do (( skipped_sz += _s )); done
 
+    # Compute all estimated sizes in one Python call
     local heic_est img_est vid_est other_est
-    heic_est=$(dry_run_estimate "$heic_sz" "$heic_ratio")
-    img_est=$(dry_run_estimate "$img_sz" "$img_ratio")
-    vid_est=$(dry_run_estimate "$vid_sz" "$vid_ratio")
-    other_est=$(dry_run_estimate "$other_sz" "$other_ratio")
+    read -r heic_est img_est vid_est other_est < <(python3 - \
+        "$heic_sz" "$heic_ratio" "$img_sz" "$img_ratio" \
+        "$vid_sz"  "$vid_ratio"  "$other_sz" "$other_ratio" <<'PY'
+import sys
+a = sys.argv[1:]
+out = []
+for i in range(0, 8, 2):
+    total, ratio = int(a[i]), float(a[i+1])
+    out.append(str(int(total * (1 - ratio / 100))))
+print(' '.join(out))
+PY
+)
 
     local total_before=$(( heic_sz + img_sz + vid_sz + other_sz ))
     local total_after=$(( heic_est + img_est + vid_est + other_est ))
@@ -568,6 +576,7 @@ run_dry_run() {
 main() {
     local level="moderate"
     local dry_run=0
+    local skip_copy=0
     local log_file=""
     local positional=()
     local ov_jpeg_quality="" ov_png_comp="" ov_img_max_dim=""
@@ -577,6 +586,7 @@ main() {
         case "$1" in
             -h|--help)           usage; exit 0 ;;
             --dry-run)           dry_run=1; shift ;;
+            --skip-copy)         skip_copy=1; shift ;;
             --level)             [[ $# -ge 2 ]] || fail "--level requires a value"; level="$2"; shift 2 ;;
             --level=*)           level="${1#--level=}"; shift ;;
             --only-exts)         [[ $# -ge 2 ]] || fail "--only-exts requires a value"; FILTER_EXTS="$2"; shift 2 ;;
@@ -673,7 +683,6 @@ main() {
     [[ -z "$dest_dir" ]] && dest_dir="${source_dir%/}_optimized"
 
     require_command python3
-    require_command rsync
 
     if [[ -n "$log_file" ]]; then
         exec > >(tee -a "$log_file") 2>&1
@@ -684,14 +693,23 @@ main() {
     src_abs="$(abs_path "$source_dir")"
     dest_abs="$(abs_path "$dest_dir")"
 
-    [[ -e "$dest_abs"              ]] && fail "Destination '$dest_abs' already exists. Delete it or choose another path."
-    [[ "$dest_abs" == "$src_abs"   ]] && fail "Destination must differ from source."
-    [[ "$dest_abs" == "$src_abs"/* ]] && fail "Destination may not be inside source."
-    [[ "$src_abs"  == "$dest_abs"/*]] && fail "Source may not be inside destination."
+    if (( ! skip_copy )); then
+        require_command rsync
+        [[ -e "$dest_abs"              ]] && fail "Destination '$dest_abs' already exists. Delete it or use --skip-copy."
+        [[ "$dest_abs" == "$src_abs"   ]] && fail "Destination must differ from source."
+        [[ "$dest_abs" == "$src_abs"/* ]] && fail "Destination may not be inside source."
+        [[ "$src_abs"  == "$dest_abs"/* ]] && fail "Source may not be inside destination."
+    else
+        [[ -d "$dest_abs" ]] || fail "--skip-copy: destination '$dest_abs' does not exist"
+    fi
 
     echo "============================================"
-    printf 'Source      : %s\n' "$src_abs"
-    printf 'Destination : %s\n' "$dest_abs"
+    if (( skip_copy )); then
+        printf 'Directory   : %s\n' "$dest_abs"
+    else
+        printf 'Source      : %s\n' "$src_abs"
+        printf 'Destination : %s\n' "$dest_abs"
+    fi
     printf 'Level       : %s\n' "$level"
     [[ -n "$FILTER_EXTS" ]] && printf 'Extensions  : %s\n' "$FILTER_EXTS"
     printf 'Settings    : JPEG %d  PNG-comp %d  max-dim %dpx  CRF %d  preset %s  %dx%d  audio %s\n' \
@@ -705,19 +723,24 @@ main() {
         exit 0
     fi
 
-    check_free_space "$src_abs" "$(dirname "$dest_abs")"
+    if (( ! skip_copy )); then
+        check_free_space "$src_abs" "$(dirname "$dest_abs")" "$level"
+    fi
     init_image_tool
     require_command ffmpeg
 
     STATS_DIR=$(mktemp -d)
     local START_TIME=$SECONDS
 
-    echo "Step 1/2: Copying '$src_abs' → '$dest_abs' ..."
-    mkdir -p "$dest_abs"
-    rsync -a --info=progress2 --human-readable "$src_abs"/ "$dest_abs"/
-    echo
-
-    echo "Step 2/2: Optimizing copy ..."
+    if (( ! skip_copy )); then
+        echo "Step 1/2: Copying '$src_abs' → '$dest_abs' ..."
+        mkdir -p "$dest_abs"
+        rsync -a --info=progress2 --human-readable "$src_abs"/ "$dest_abs"/
+        echo
+        echo "Step 2/2: Optimizing copy ..."
+    else
+        echo "Skipping copy (--skip-copy). Optimizing '$dest_abs' in place ..."
+    fi
     echo
     run_optimization "$dest_abs"
 
@@ -727,11 +750,15 @@ main() {
 
     echo
     echo "Disk usage (du -sh):"
-    du -sh "$src_abs" "$dest_abs"
+    if (( ! skip_copy )); then
+        du -sh "$src_abs" "$dest_abs"
+    else
+        du -sh "$dest_abs"
+    fi
     echo
     echo "Done."
     echo "  Optimized copy : $dest_abs"
-    echo "  Original       : $src_abs  (untouched)"
+    (( ! skip_copy )) && echo "  Original       : $src_abs  (untouched)"
 }
 
 main "$@"

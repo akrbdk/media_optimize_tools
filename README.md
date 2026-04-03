@@ -53,6 +53,9 @@ Makes an rsync copy of SOURCE_DIR and optimizes it. The original is never touche
 # Process only specific extensions
 ./run.sh optimize --only-exts heic,mov /media/usb/Photos
 ./run.sh optimize --only-exts jpg,jpeg,png --level aggressive /media/usb/Photos
+
+# Skip rsync, optimize an already-copied directory (e.g. after interrupted run)
+./run.sh optimize --skip-copy --level aggressive /media/usb/Photos_opt
 ```
 
 ### All options
@@ -62,8 +65,9 @@ Makes an rsync copy of SOURCE_DIR and optimizes it. The original is never touche
                                archive | moderate | aggressive | maximum
 --only-exts EXT[,EXT,...]      Process only these extensions, e.g. heic,mov,jpg
 --dry-run                      Show estimated savings per type, make no changes
+--skip-copy                    Skip rsync; optimize an already-copied directory
 --log FILE                     Write output to file + terminal
---jobs N                       Parallel workers for photo/HEIC (default: 1)
+--jobs N                       Parallel workers for photo/HEIC/video (default: 1)
 
 Quality overrides (applied on top of --level):
 --jpeg-quality N      JPEG/WEBP quality (1-100)
