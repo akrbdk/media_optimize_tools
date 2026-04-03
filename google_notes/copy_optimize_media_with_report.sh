@@ -15,11 +15,15 @@ readonly DEFAULT_AUDIO_BITRATE="${NOTES_VIDEO_AUDIO_BITRATE:-128k}"
 
 usage() {
     cat <<'EOF'
-Usage: copy_optimize_media_with_report.sh SOURCE_DIR [DESTINATION_DIR]
+Usage: copy_optimize_media_with_report.sh [OPTIONS] SOURCE_DIR [DESTINATION_DIR]
 
 Creates an optimized copy of SOURCE_DIR (images + videos) and prints a detailed before/after
 report showing counts, sizes, and savings so you can judge the benefit before importing
 into Google Notes/Keep.
+
+Options:
+  --log FILE   Append all output to FILE in addition to the terminal
+  -h, --help   Show this help
 
 Environment overrides (images):
   NOTES_MAX_DIM
@@ -92,6 +96,35 @@ saved = before - after
 percent = (saved / before) * 100
 print(f"{percent:+.1f}%")
 PY
+}
+
+format_elapsed() {
+    local secs="$1"
+    local h=$(( secs / 3600 ))
+    local m=$(( (secs % 3600) / 60 ))
+    local s=$(( secs % 60 ))
+    if (( h > 0 )); then
+        printf '%dh %dm %ds' "$h" "$m" "$s"
+    elif (( m > 0 )); then
+        printf '%dm %ds' "$m" "$s"
+    else
+        printf '%ds' "$s"
+    fi
+}
+
+check_free_space() {
+    local src="$1"
+    local dest_parent="$2"
+    local src_bytes free_bytes
+    src_bytes=$(du -sb "$src" 2>/dev/null | cut -f1) || return 0
+    free_bytes=$(df -B1 --output=avail "$dest_parent" 2>/dev/null | tail -1 | tr -d ' ') || return 0
+    if (( src_bytes > free_bytes )); then
+        echo "WARNING: Source is ~$(format_bytes "$src_bytes") but only $(format_bytes "$free_bytes") free on destination." >&2
+        printf 'Continue anyway? [y/N] ' >&2
+        local reply
+        read -r reply </dev/tty || reply=n
+        [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted." >&2; exit 1; }
+    fi
 }
 
 declare -a FILE_ORDER=()
@@ -177,27 +210,39 @@ optimize_image_file() {
     ext="${ext,,}"
     case "$ext" in
         jpg|jpeg) optimize_jpeg "$file" ;;
-        png) optimize_png "$file" ;;
-        webp) optimize_webp "$file" ;;
+        png)      optimize_png "$file" ;;
+        webp)     optimize_webp "$file" ;;
         heic|heif) optimize_heic "$file" ;;
         *) return 1 ;;
     esac
 }
 
+# Tracks the current video temp file so the trap can clean it up on interrupt
+VIDEO_TEMP_FILE=""
+REPORT_TEMP_FILE=""
+cleanup() {
+    [[ -n "$VIDEO_TEMP_FILE"  ]] && rm -f "$VIDEO_TEMP_FILE"
+    [[ -n "$REPORT_TEMP_FILE" ]] && rm -f "$REPORT_TEMP_FILE"
+}
+trap cleanup EXIT INT TERM
+
 optimize_video_file() {
     local file="$1"
     local tmp="${file}.optimized.$$"
+    VIDEO_TEMP_FILE="$tmp"
     local scale="scale='min(${MAX_WIDTH},iw)':'min(${MAX_HEIGHT},ih)':force_original_aspect_ratio=decrease"
 
-    if ffmpeg -hide_banner -loglevel error -y -i "$file" \
+    if ffmpeg -hide_banner -loglevel warning -stats -y -i "$file" \
         -vf "$scale" \
         -c:v libx264 -preset "$VIDEO_PRESET" -crf "$VIDEO_CRF" -pix_fmt yuv420p -movflags +faststart \
         -c:a aac -b:a "$AUDIO_BITRATE" \
         "$tmp"; then
         mv "$tmp" "$file"
+        VIDEO_TEMP_FILE=""
         return 0
     else
         rm -f "$tmp"
+        VIDEO_TEMP_FILE=""
         return 1
     fi
 }
@@ -257,6 +302,7 @@ print_summary_line() {
 }
 
 print_summary() {
+    local elapsed="$1"
     local images_before="${TYPE_BEFORE[images]}"
     local images_after="${TYPE_AFTER[images]}"
     local videos_before="${TYPE_BEFORE[videos]}"
@@ -270,19 +316,19 @@ print_summary() {
     print_summary_line "Images" "${TYPE_COUNT[images]}" "$images_before" "$images_after"
     print_summary_line "Videos" "${TYPE_COUNT[videos]}" "$videos_before" "$videos_after"
     print_summary_line "Total"  "$(( TYPE_COUNT[images] + TYPE_COUNT[videos] ))" "$total_before" "$total_after"
+    printf 'Elapsed : %s\n' "$(format_elapsed "$elapsed")"
 
     if (( total_before > 0 )); then
         echo
         echo "Top files by savings:"
-        local report_file
-        report_file=$(mktemp)
+        REPORT_TEMP_FILE=$(mktemp)
         for rel in "${FILE_ORDER[@]}"; do
             local before="${FILE_BEFORE_SIZE[$rel]}"
             local after="${FILE_AFTER_SIZE[$rel]}"
             local saved=$(( before - after ))
-            printf '%s|%s|%s|%s|%s\0' "$rel" "${FILE_TYPE[$rel]}" "$before" "$after" "$saved" >>"$report_file"
+            printf '%s|%s|%s|%s|%s\0' "$rel" "${FILE_TYPE[$rel]}" "$before" "$after" "$saved" >>"$REPORT_TEMP_FILE"
         done
-        if [[ -s "$report_file" ]]; then
+        if [[ -s "$REPORT_TEMP_FILE" ]]; then
             local printed=0
             while IFS='|' read -r -d '' rel type before after saved; do
                 (( ++printed ))
@@ -295,33 +341,49 @@ print_summary() {
                     "$(format_bytes "$saved")" \
                     "$(format_percent_saved "$before" "$after")"
                 (( printed == 1000 )) && break
-            done < <(sort -z -t'|' -k5,5nr "$report_file")
+            done < <(sort -z -t'|' -k5,5nr "$REPORT_TEMP_FILE")
             (( printed == 0 )) && echo "  No files changed."
         else
             echo "  No files changed."
         fi
-        rm -f "$report_file"
+        rm -f "$REPORT_TEMP_FILE"
+        REPORT_TEMP_FILE=""
     fi
 }
 
 main() {
-    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-        usage
-        exit 0
-    fi
+    local log_file=""
+    local positional=()
 
-    [[ $# -ge 1 ]] || { usage; exit 1; }
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)  usage; exit 0 ;;
+            --log)      [[ $# -ge 2 ]] || fail "--log requires a value"; log_file="$2"; shift 2 ;;
+            --log=*)    log_file="${1#--log=}"; shift ;;
+            --)         shift; positional+=("$@"); break ;;
+            -*)         fail "Unknown option: $1" ;;
+            *)          positional+=("$1"); shift ;;
+        esac
+    done
 
-    local source_dir="$1"
+    [[ ${#positional[@]} -ge 1 ]] || { usage; exit 1; }
+
+    local source_dir="${positional[0]}"
     [[ -d "$source_dir" ]] || fail "Source directory '$source_dir' does not exist"
 
-    local destination_dir="${2:-}"
+    local destination_dir="${positional[1]:-}"
     if [[ -z "$destination_dir" ]]; then
         destination_dir="${source_dir%/}_compressed"
     fi
 
     require_command python3
     require_command rsync
+
+    # Set up log file tee before any output
+    if [[ -n "$log_file" ]]; then
+        exec > >(tee -a "$log_file") 2>&1
+        echo "Logging to: $log_file"
+    fi
 
     SRC_ABS="$(abs_path "$source_dir")"
     DEST_ABS="$(abs_path "$destination_dir")"
@@ -330,6 +392,9 @@ main() {
     [[ "$DEST_ABS" == "$SRC_ABS" ]] && fail "Destination must differ from source."
     [[ "$DEST_ABS" == "$SRC_ABS"/* ]] && fail "Destination may not be inside the source directory."
     [[ "$SRC_ABS" == "$DEST_ABS"/* ]] && fail "Source may not be inside the destination directory."
+
+    # Check disk space before starting the copy
+    check_free_space "$SRC_ABS" "$(dirname "$DEST_ABS")"
 
     gather_files
 
@@ -356,15 +421,17 @@ main() {
     VIDEO_PRESET="$DEFAULT_VIDEO_PRESET"
     AUDIO_BITRATE="$DEFAULT_AUDIO_BITRATE"
 
-    [[ "$MAX_DIMENSION" =~ ^[0-9]+$ ]] || fail "NOTES_MAX_DIM must be an integer"
-    [[ "$JPEG_QUALITY" =~ ^[0-9]+$ ]] || fail "NOTES_JPEG_QUALITY must be an integer"
-    [[ "$WEBP_QUALITY" =~ ^[0-9]+$ ]] || fail "NOTES_WEBP_QUALITY must be an integer"
+    [[ "$MAX_DIMENSION" =~ ^[0-9]+$ ]]  || fail "NOTES_MAX_DIM must be an integer"
+    [[ "$JPEG_QUALITY" =~ ^[0-9]+$ ]]   || fail "NOTES_JPEG_QUALITY must be an integer"
+    [[ "$WEBP_QUALITY" =~ ^[0-9]+$ ]]   || fail "NOTES_WEBP_QUALITY must be an integer"
     [[ "$PNG_COMPRESSION" =~ ^[0-9]+$ ]] || fail "NOTES_PNG_COMPRESSION must be an integer"
 
-    [[ "$MAX_WIDTH" =~ ^[0-9]+$ ]] || fail "NOTES_VIDEO_MAX_WIDTH must be an integer"
-    [[ "$MAX_HEIGHT" =~ ^[0-9]+$ ]] || fail "NOTES_VIDEO_MAX_HEIGHT must be an integer"
-    [[ "$VIDEO_CRF" =~ ^[0-9]+$ ]] || fail "NOTES_VIDEO_CRF must be an integer"
+    [[ "$MAX_WIDTH" =~ ^[0-9]+$ ]]      || fail "NOTES_VIDEO_MAX_WIDTH must be an integer"
+    [[ "$MAX_HEIGHT" =~ ^[0-9]+$ ]]     || fail "NOTES_VIDEO_MAX_HEIGHT must be an integer"
+    [[ "$VIDEO_CRF" =~ ^[0-9]+$ ]]      || fail "NOTES_VIDEO_CRF must be an integer"
     [[ "$AUDIO_BITRATE" =~ ^[0-9]+[kKmM]?$ ]] || fail "NOTES_VIDEO_AUDIO_BITRATE must be like 128k"
+
+    local START_TIME=$SECONDS
 
     echo "Copying '$SRC_ABS' -> '$DEST_ABS' ..."
     copy_directory "$SRC_ABS" "$DEST_ABS"
@@ -375,7 +442,7 @@ main() {
     fi
 
     update_after_sizes
-    print_summary
+    print_summary "$(( SECONDS - START_TIME ))"
 
     echo
     echo "Disk usage (du -sh):"

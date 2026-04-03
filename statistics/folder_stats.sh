@@ -7,15 +7,17 @@ DEFAULT_TOP_FILES="${FOLDER_STATS_TOP_FILES:-50}"
 
 usage() {
     cat <<'EOF'
-Usage: folder_stats.sh TARGET_DIR [--depth N] [--top-files K]
+Usage: folder_stats.sh [OPTIONS] TARGET_DIR
 
 Prints a quick summary of disk usage per subdirectory and lists the largest files
 inside TARGET_DIR. No files are modified; this is purely informational so you can spot
 heavy folders before running optimization scripts.
 
-Environment overrides:
-  FOLDER_STATS_DEPTH      default 2
-  FOLDER_STATS_TOP_FILES  default 50
+Options:
+  --depth N        Subdirectory depth for du breakdown (default: 2, override: FOLDER_STATS_DEPTH)
+  --top-files K    Show top K largest files (default: 50, override: FOLDER_STATS_TOP_FILES)
+  --log FILE       Append all output to FILE in addition to the terminal
+  -h, --help       Show this help
 EOF
 }
 
@@ -26,6 +28,20 @@ fail() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but was not found in PATH"
+}
+
+format_elapsed() {
+    local secs="$1"
+    local h=$(( secs / 3600 ))
+    local m=$(( (secs % 3600) / 60 ))
+    local s=$(( secs % 60 ))
+    if (( h > 0 )); then
+        printf '%dh %dm %ds' "$h" "$m" "$s"
+    elif (( m > 0 )); then
+        printf '%dm %ds' "$m" "$s"
+    else
+        printf '%ds' "$s"
+    fi
 }
 
 print_directory_usage() {
@@ -51,49 +67,61 @@ print_largest_files() {
 }
 
 main() {
-    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-        usage
-        exit 0
-    fi
-
-    [[ $# -ge 1 ]] || { usage; exit 1; }
-    local target_dir="$1"
-    shift
-
-    [[ -d "$target_dir" ]] || fail "Directory '$target_dir' does not exist"
-
     local depth="$DEFAULT_DEPTH"
     local top_files="$DEFAULT_TOP_FILES"
+    local log_file=""
+    local target_dir=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help)
+                usage; exit 0 ;;
             --depth)
-                shift
-                [[ -n "${1:-}" ]] || fail "--depth requires a value"
-                depth="$1"
-                ;;
+                [[ $# -ge 2 ]] || fail "--depth requires a value"
+                depth="$2"; shift 2 ;;
+            --depth=*)
+                depth="${1#--depth=}"; shift ;;
             --top-files)
-                shift
-                [[ -n "${1:-}" ]] || fail "--top-files requires a value"
-                top_files="$1"
-                ;;
+                [[ $# -ge 2 ]] || fail "--top-files requires a value"
+                top_files="$2"; shift 2 ;;
+            --top-files=*)
+                top_files="${1#--top-files=}"; shift ;;
+            --log)
+                [[ $# -ge 2 ]] || fail "--log requires a value"
+                log_file="$2"; shift 2 ;;
+            --log=*)
+                log_file="${1#--log=}"; shift ;;
+            -*)
+                fail "Unknown option: $1" ;;
             *)
-                fail "Unknown option: $1"
-                ;;
+                [[ -z "$target_dir" ]] || fail "Unexpected argument: $1"
+                target_dir="$1"; shift ;;
         esac
-        shift || break
     done
 
-    [[ "$depth" =~ ^[0-9]+$ ]] || fail "Depth must be an integer"
-    [[ "$top_files" =~ ^[0-9]+$ ]] || fail "Top file count must be an integer"
+    [[ -n "$target_dir" ]] || { usage; exit 1; }
+    [[ -d "$target_dir" ]] || fail "Directory '$target_dir' does not exist"
+    [[ "$depth" =~ ^[0-9]+$ ]]     || fail "--depth must be an integer"
+    [[ "$top_files" =~ ^[0-9]+$ ]] || fail "--top-files must be an integer"
 
     require_command du
     require_command find
+
+    # Set up log file tee before any output
+    if [[ -n "$log_file" ]]; then
+        exec > >(tee -a "$log_file") 2>&1
+        echo "Logging to: $log_file"
+    fi
+
+    local START_TIME=$SECONDS
 
     echo "Analyzing: $(realpath "$target_dir")"
     echo
     print_directory_usage "$target_dir" "$depth"
     print_largest_files "$target_dir" "$top_files"
+
+    echo
+    printf 'Elapsed: %s\n' "$(format_elapsed "$(( SECONDS - START_TIME ))")"
 }
 
 main "$@"
