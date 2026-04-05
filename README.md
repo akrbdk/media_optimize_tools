@@ -20,14 +20,16 @@ The destination folder is named automatically: `SOURCE_DIR_<level>` (e.g. `Photo
 
 - MOV → MP4 H.264 + AAC (always — plays everywhere)
 - JPEG, WEBP → recompressed, EXIF preserved (date, GPS, camera)
-- PNG → lossless recompression, EXIF preserved
+- PNG → converted to JPEG, EXIF preserved (much smaller than lossless PNG)
 - MP4/MKV/AVI → re-encoded at `moderate`, `aggressive`, `maximum`
+
+After optimization finishes, folder statistics are automatically printed for both the original and the optimized copy so you can compare them without running `stats` manually.
 
 ### Levels
 
 |                | `archive`       | `moderate` (default) | `aggressive`            | `maximum`              |
 |----------------|-----------------|----------------------|-------------------------|------------------------|
-| JPEG quality   | 95              | 88                   | 80                      | 70                     |
+| JPEG/PNG quality | 95            | 88                   | 80                      | 70                     |
 | Max photo size | no limit        | 8000px               | 3840px                  | 2560px                 |
 | MOV → MP4      | CRF 20, 4K slow | CRF 25, 4K           | CRF 28, 1080p           | CRF 32, 720p           |
 | MP4/MKV/AVI    | skip            | re-encode CRF 25, 4K | re-encode CRF 28, 1080p | re-encode CRF 32, 720p |
@@ -35,7 +37,7 @@ The destination folder is named automatically: `SOURCE_DIR_<level>` (e.g. `Photo
 ### Examples
 
 ```bash
-# Default (moderate): optimize with good quality, all video re-encoded
+# Default (moderate): good quality, all video re-encoded
 ./run.sh optimize /media/usb/Photos
 
 # Aggressive: maximum savings, quality still fine for personal archive
@@ -58,6 +60,10 @@ The destination folder is named automatically: `SOURCE_DIR_<level>` (e.g. `Photo
 ./run.sh optimize --skip-exts mp4,mkv /media/usb/Photos
 ./run.sh optimize --level aggressive --skip-exts mp4,mkv,avi /media/usb/Photos
 
+# Re-compress only large files (skip files that are already small enough)
+./run.sh optimize --skip-copy --level aggressive \
+    --min-photo-mb 4 --min-video-mb 80 /media/usb/Photos_aggressive
+
 # Fine-tune quality on top of a level
 ./run.sh optimize --level moderate --crf 22 --preset slow /media/usb/Photos
 ./run.sh optimize --level aggressive --jpeg-quality 85 /media/usb/Photos
@@ -79,14 +85,17 @@ The destination folder is named automatically: `SOURCE_DIR_<level>` (e.g. `Photo
 --jobs N                       Parallel workers for photo/video (default: 1)
 
 Quality overrides (applied on top of --level):
---jpeg-quality N      JPEG/WEBP quality (1-100)
---png-compression N   PNG compression level 0-9 (lossless)
+--jpeg-quality N      JPEG/PNG quality (1-100, PNG is converted to JPEG)
 --max-image-dim N     Resize photo if longest side > N pixels
 --crf N               Video CRF 0-51 (lower = better quality)
 --preset NAME         ffmpeg preset: ultrafast fast medium slow veryslow
 --max-width N         Downscale video if wider than N pixels
 --max-height N        Downscale video if taller than N pixels
 --audio-bitrate VAL   AAC bitrate, e.g. 128k 192k 256k
+
+Size filters (skip files already small enough):
+--min-photo-mb N      Skip photos smaller than N MB
+--min-video-mb N      Skip videos/MOV smaller than N MB
 ```
 
 ---
@@ -152,11 +161,90 @@ Files that need aggressive compression:
 # 2. Preview savings before running
 ./run.sh optimize --dry-run --level aggressive /media/usb/Photos
 
-# 3. Run optimization
+# 3. Run optimization (stats comparison printed automatically at the end)
 ./run.sh optimize --level aggressive /media/usb/Photos
 
-# 4. Verify result
-./run.sh stats /media/usb/Photos_aggressive
+# 4. If some files are still too large, re-compress only those
+./run.sh optimize --skip-copy --level aggressive \
+    --min-photo-mb 4 --min-video-mb 80 /media/usb/Photos_aggressive
+```
+
+---
+
+## Real-world scenarios
+
+### Scenario 1 — iPhone photo backup, first-time archive
+
+iPhone exports a mix of JPEG, PNG (screenshots), and MOV (videos).
+Goal: shrink to 40–60% of original size while keeping quality for a personal archive.
+
+```bash
+# Check what you have
+./run.sh stats --depth 2 /media/usb/iPhone_2024
+
+# Preview savings
+./run.sh optimize --dry-run --level aggressive /media/usb/iPhone_2024
+
+# Run optimization
+# MOV → MP4, PNG → JPEG, all JPEG recompressed, stats printed at the end
+./run.sh optimize --level aggressive /media/usb/iPhone_2024
+```
+
+---
+
+### Scenario 2 — Re-optimize an existing archive (already optimized before)
+
+You already have `Photos_aggressive` but some large files were missed or added later.
+
+```bash
+# See what's still large
+./run.sh stats --photo-mb 3 --video-mb 50 /media/usb/Photos_aggressive
+
+# Re-compress only the files above the threshold, skip everything else
+./run.sh optimize --skip-copy --level aggressive \
+    --min-photo-mb 3 --min-video-mb 50 /media/usb/Photos_aggressive
+```
+
+---
+
+### Scenario 3 — Only compress videos, keep photos untouched
+
+You already have good photos but want to shrink bulky MOV files.
+
+```bash
+./run.sh optimize --only-exts mov --level aggressive /media/usb/Photos
+```
+
+---
+
+### Scenario 4 — Keep original MP4/MKV, only convert MOV
+
+Your MP4/MKV files are already compressed. Only convert raw MOV files from iPhone.
+
+```bash
+./run.sh optimize --skip-exts mp4,mkv,avi --level aggressive /media/usb/Photos
+```
+
+---
+
+### Scenario 5 — Max quality, just convert MOV to MP4
+
+Archive-level: near-lossless quality, just get rid of MOV format for compatibility.
+
+```bash
+./run.sh optimize --level archive --only-exts mov /media/usb/Photos
+```
+
+---
+
+### Scenario 6 — Large family archive, process folder by folder
+
+The archive is huge. Process one year at a time to be safe.
+
+```bash
+for year in /media/usb/Archive/20*/; do
+    ./run.sh optimize --level aggressive --log ~/opt.log "$year"
+done
 ```
 
 ---
@@ -180,17 +268,15 @@ Files that need aggressive compression:
 ```bash
 ./run.sh optimize --level aggressive /path/to/archive
 # Creates /path/to/archive_aggressive. Original is not modified.
+# Folder stats are printed at the end — no need to run stats manually.
 ```
 
 ### Step 4 — verify the copy
 
 ```bash
-# Compare file counts — must match
+# Compare file counts — must match (PNG files will show as JPEG now)
 find /path/to/archive -type f | wc -l
 find /path/to/archive_aggressive -type f | wc -l
-
-# Check for problematic files in the result
-./run.sh stats /path/to/archive_aggressive
 
 # Open a few photos and videos manually and check quality
 ```
@@ -199,7 +285,7 @@ Checklist before deleting originals:
 
 - [ ] Several photos opened normally
 - [ ] Videos play correctly
-- [ ] File counts match
+- [ ] File counts match (PNG → JPEG conversion changes the count if there were PNGs)
 - [ ] Photo dates are preserved (check EXIF in file properties)
 - [ ] The copy is on a **different drive** or backed up to cloud
 

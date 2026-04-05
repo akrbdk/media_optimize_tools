@@ -17,25 +17,25 @@ set -euo pipefail
 
 # ── Level presets ────────────────────────────────────────────────────────────
 # archive: convert formats only, near-lossless quality
-readonly ARC_JPEG_QUALITY=95   ARC_PNG_COMPRESSION=6  ARC_IMG_MAX_DIM=99999
+readonly ARC_JPEG_QUALITY=95   ARC_IMG_MAX_DIM=99999
 readonly ARC_VIDEO_CRF=20      ARC_VIDEO_PRESET="slow"
 readonly ARC_VIDEO_MAX_W=3840  ARC_VIDEO_MAX_H=2160   ARC_AUDIO_BITRATE="256k"
 readonly ARC_REENCODE_ALL_VIDEO=0
 
 # moderate: safe everyday optimization, loss barely noticeable
-readonly MOD_JPEG_QUALITY=88   MOD_PNG_COMPRESSION=7  MOD_IMG_MAX_DIM=8000
+readonly MOD_JPEG_QUALITY=88   MOD_IMG_MAX_DIM=8000
 readonly MOD_VIDEO_CRF=25      MOD_VIDEO_PRESET="medium"
 readonly MOD_VIDEO_MAX_W=3840  MOD_VIDEO_MAX_H=2160   MOD_AUDIO_BITRATE="192k"
 readonly MOD_REENCODE_ALL_VIDEO=1
 
 # aggressive: visible savings, quality still acceptable
-readonly AGG_JPEG_QUALITY=80   AGG_PNG_COMPRESSION=9  AGG_IMG_MAX_DIM=3840
+readonly AGG_JPEG_QUALITY=80   AGG_IMG_MAX_DIM=3840
 readonly AGG_VIDEO_CRF=28      AGG_VIDEO_PRESET="medium"
 readonly AGG_VIDEO_MAX_W=1920  AGG_VIDEO_MAX_H=1080   AGG_AUDIO_BITRATE="192k"
 readonly AGG_REENCODE_ALL_VIDEO=1
 
 # maximum: max space savings, noticeable quality loss
-readonly MAX_JPEG_QUALITY=70   MAX_PNG_COMPRESSION=9  MAX_IMG_MAX_DIM=2560
+readonly MAX_JPEG_QUALITY=70   MAX_IMG_MAX_DIM=2560
 readonly MAX_VIDEO_CRF=32      MAX_VIDEO_PRESET="medium"
 readonly MAX_VIDEO_MAX_W=1280  MAX_VIDEO_MAX_H=720    MAX_AUDIO_BITRATE="128k"
 readonly MAX_REENCODE_ALL_VIDEO=1
@@ -80,14 +80,15 @@ Extension filters:
     --skip-exts mov              skip MOV conversion
 
 Quality overrides (applied on top of --level, for fine-tuning):
-  --jpeg-quality N     JPEG/WEBP quality 1-100
-  --png-compression N  PNG compression 0-9 (lossless)
+  --jpeg-quality N     JPEG/WEBP/PNG quality 1-100 (PNG is converted to JPEG)
   --max-image-dim N    Resize if longest side > N pixels
   --crf N              Video CRF 0-51 (lower = better quality)
   --preset NAME        ffmpeg preset: ultrafast fast medium slow veryslow
   --max-width N        Downscale video if wider than N px
   --max-height N       Downscale video if taller than N px
   --audio-bitrate VAL  AAC bitrate e.g. 128k 192k 256k
+  --min-photo-mb N     Skip photos already smaller than N MB
+  --min-video-mb N     Skip videos/MOV already smaller than N MB
 
 Examples:
   media_optimize.sh /media/usb/Photos
@@ -161,6 +162,8 @@ check_free_space() {
 # ── Extension filter ──────────────────────────────────────────────────────────
 FILTER_EXTS=""   # --only-exts: empty = allow all
 SKIP_EXTS=""     # --skip-exts: empty = skip nothing
+MIN_PHOTO_BYTES=0  # --min-photo-mb: skip photos smaller than this (0 = process all)
+MIN_VIDEO_BYTES=0  # --min-video-mb: skip videos smaller than this (0 = process all)
 
 ext_allowed() {
     local ext="${1,,}"
@@ -225,10 +228,13 @@ collect_media_files() {
         ext_allowed "$_ext" || continue
         case "$_ext" in
             jpg|jpeg|png|webp)
+                (( MIN_PHOTO_BYTES > 0 && _sz < MIN_PHOTO_BYTES )) && continue
                 img_files+=("$_path"); img_sizes+=("$_sz") ;;
             mov)
+                (( MIN_VIDEO_BYTES > 0 && _sz < MIN_VIDEO_BYTES )) && continue
                 video_primary+=("$_path"); video_primary_sizes+=("$_sz") ;;
             mp4|mkv|avi|m4v|webm|mpg|mpeg)
+                (( MIN_VIDEO_BYTES > 0 && _sz < MIN_VIDEO_BYTES )) && continue
                 if (( REENCODE_ALL_VIDEO )); then
                     video_other+=("$_path"); video_other_sizes+=("$_sz")
                 elif (( with_skipped )); then
@@ -241,29 +247,32 @@ collect_media_files() {
 
 # ── Per-file processors ───────────────────────────────────────────────────────
 
-# Optimize JPEG/WEBP/PNG in the copy. Replaces only if result is smaller.
+# Optimize JPEG/WEBP in place, convert PNG → JPEG. Replaces only if result is smaller.
 # Writes result to $stats_file: "photo|rel|sz_before|sz_after"
 optimize_photo() {
     local file="$1" rel="$2" stats_file="$3"
     local ext="${file##*.}"; ext="${ext,,}"
-    local tmp="${file}.opt.${BASHPID}"
+    local dst tmp
 
-    local extra_args=()
-    case "$ext" in
-        jpg|jpeg|webp) extra_args=(-quality "$JPEG_QUALITY") ;;
-        png)           extra_args=(-define "png:compression-level=${PNG_COMPRESSION}" \
-                                   -define png:exclude-chunk=all) ;;
-    esac
+    # PNG is converted to JPEG (much smaller for photos); other formats re-encode in place
+    if [[ "$ext" == "png" ]]; then
+        dst="${file%.*}.jpg"
+        tmp="${file%.*}.opt.${BASHPID}.jpg"   # explicit .jpg so ImageMagick outputs JPEG
+    else
+        dst="$file"
+        tmp="${file}.opt.${BASHPID}"
+    fi
 
     local sz_before sz_after
     sz_before=$(stat -c%s -- "$file")
 
     if run_convert -auto-orient +profile "!exif,*" \
         -resize "${IMG_MAX_DIM}x${IMG_MAX_DIM}>" \
-        "${extra_args[@]}" "$file" "$tmp" 2>/dev/null; then
+        -quality "$JPEG_QUALITY" "$file" "$tmp" 2>/dev/null; then
         sz_after=$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)
         if (( sz_after > 0 && sz_after < sz_before )); then
-            mv "$tmp" "$file"
+            mv "$tmp" "$dst"
+            [[ "$file" != "$dst" ]] && rm -f "$file"
             printf 'photo|%s|%d|%d\n' "$rel" "$sz_before" "$sz_after" > "$stats_file"
             return
         fi
@@ -518,8 +527,9 @@ main() {
     local skip_copy=0
     local log_file=""
     local positional=()
-    local ov_jpeg_quality="" ov_png_comp="" ov_img_max_dim=""
+    local ov_jpeg_quality="" ov_img_max_dim=""
     local ov_crf="" ov_preset="" ov_max_w="" ov_max_h="" ov_audio=""
+    local ov_min_photo_mb="" ov_min_video_mb=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -538,8 +548,6 @@ main() {
             --log=*)             log_file="${1#--log=}"; shift ;;
             --jpeg-quality)      [[ $# -ge 2 ]] || fail "--jpeg-quality requires a value"; ov_jpeg_quality="$2"; shift 2 ;;
             --jpeg-quality=*)    ov_jpeg_quality="${1#--jpeg-quality=}"; shift ;;
-            --png-compression)   [[ $# -ge 2 ]] || fail "--png-compression requires a value"; ov_png_comp="$2"; shift 2 ;;
-            --png-compression=*) ov_png_comp="${1#--png-compression=}"; shift ;;
             --max-image-dim)     [[ $# -ge 2 ]] || fail "--max-image-dim requires a value"; ov_img_max_dim="$2"; shift 2 ;;
             --max-image-dim=*)   ov_img_max_dim="${1#--max-image-dim=}"; shift ;;
             --crf)               [[ $# -ge 2 ]] || fail "--crf requires a value"; ov_crf="$2"; shift 2 ;;
@@ -552,6 +560,10 @@ main() {
             --max-height=*)      ov_max_h="${1#--max-height=}"; shift ;;
             --audio-bitrate)     [[ $# -ge 2 ]] || fail "--audio-bitrate requires a value"; ov_audio="$2"; shift 2 ;;
             --audio-bitrate=*)   ov_audio="${1#--audio-bitrate=}"; shift ;;
+            --min-photo-mb)      [[ $# -ge 2 ]] || fail "--min-photo-mb requires a value"; ov_min_photo_mb="$2"; shift 2 ;;
+            --min-photo-mb=*)    ov_min_photo_mb="${1#--min-photo-mb=}"; shift ;;
+            --min-video-mb)      [[ $# -ge 2 ]] || fail "--min-video-mb requires a value"; ov_min_video_mb="$2"; shift 2 ;;
+            --min-video-mb=*)    ov_min_video_mb="${1#--min-video-mb=}"; shift ;;
             --)                  shift; positional+=("$@"); break ;;
             -*)                  fail "Unknown option: $1" ;;
             *)                   positional+=("$1"); shift ;;
@@ -571,44 +583,46 @@ main() {
     LEVEL="$level"
     case "$level" in
         archive)
-            JPEG_QUALITY=$ARC_JPEG_QUALITY  PNG_COMPRESSION=$ARC_PNG_COMPRESSION
-            IMG_MAX_DIM=$ARC_IMG_MAX_DIM    VIDEO_CRF=$ARC_VIDEO_CRF
-            VIDEO_PRESET=$ARC_VIDEO_PRESET  VIDEO_MAX_W=$ARC_VIDEO_MAX_W
-            VIDEO_MAX_H=$ARC_VIDEO_MAX_H    AUDIO_BITRATE=$ARC_AUDIO_BITRATE
-            REENCODE_ALL_VIDEO=$ARC_REENCODE_ALL_VIDEO ;;
+            JPEG_QUALITY=$ARC_JPEG_QUALITY  IMG_MAX_DIM=$ARC_IMG_MAX_DIM
+            VIDEO_CRF=$ARC_VIDEO_CRF        VIDEO_PRESET=$ARC_VIDEO_PRESET
+            VIDEO_MAX_W=$ARC_VIDEO_MAX_W    VIDEO_MAX_H=$ARC_VIDEO_MAX_H
+            AUDIO_BITRATE=$ARC_AUDIO_BITRATE REENCODE_ALL_VIDEO=$ARC_REENCODE_ALL_VIDEO ;;
         moderate)
-            JPEG_QUALITY=$MOD_JPEG_QUALITY  PNG_COMPRESSION=$MOD_PNG_COMPRESSION
-            IMG_MAX_DIM=$MOD_IMG_MAX_DIM    VIDEO_CRF=$MOD_VIDEO_CRF
-            VIDEO_PRESET=$MOD_VIDEO_PRESET  VIDEO_MAX_W=$MOD_VIDEO_MAX_W
-            VIDEO_MAX_H=$MOD_VIDEO_MAX_H    AUDIO_BITRATE=$MOD_AUDIO_BITRATE
-            REENCODE_ALL_VIDEO=$MOD_REENCODE_ALL_VIDEO ;;
+            JPEG_QUALITY=$MOD_JPEG_QUALITY  IMG_MAX_DIM=$MOD_IMG_MAX_DIM
+            VIDEO_CRF=$MOD_VIDEO_CRF        VIDEO_PRESET=$MOD_VIDEO_PRESET
+            VIDEO_MAX_W=$MOD_VIDEO_MAX_W    VIDEO_MAX_H=$MOD_VIDEO_MAX_H
+            AUDIO_BITRATE=$MOD_AUDIO_BITRATE REENCODE_ALL_VIDEO=$MOD_REENCODE_ALL_VIDEO ;;
         aggressive)
-            JPEG_QUALITY=$AGG_JPEG_QUALITY  PNG_COMPRESSION=$AGG_PNG_COMPRESSION
-            IMG_MAX_DIM=$AGG_IMG_MAX_DIM    VIDEO_CRF=$AGG_VIDEO_CRF
-            VIDEO_PRESET=$AGG_VIDEO_PRESET  VIDEO_MAX_W=$AGG_VIDEO_MAX_W
-            VIDEO_MAX_H=$AGG_VIDEO_MAX_H    AUDIO_BITRATE=$AGG_AUDIO_BITRATE
-            REENCODE_ALL_VIDEO=$AGG_REENCODE_ALL_VIDEO ;;
+            JPEG_QUALITY=$AGG_JPEG_QUALITY  IMG_MAX_DIM=$AGG_IMG_MAX_DIM
+            VIDEO_CRF=$AGG_VIDEO_CRF        VIDEO_PRESET=$AGG_VIDEO_PRESET
+            VIDEO_MAX_W=$AGG_VIDEO_MAX_W    VIDEO_MAX_H=$AGG_VIDEO_MAX_H
+            AUDIO_BITRATE=$AGG_AUDIO_BITRATE REENCODE_ALL_VIDEO=$AGG_REENCODE_ALL_VIDEO ;;
         maximum)
-            JPEG_QUALITY=$MAX_JPEG_QUALITY  PNG_COMPRESSION=$MAX_PNG_COMPRESSION
-            IMG_MAX_DIM=$MAX_IMG_MAX_DIM    VIDEO_CRF=$MAX_VIDEO_CRF
-            VIDEO_PRESET=$MAX_VIDEO_PRESET  VIDEO_MAX_W=$MAX_VIDEO_MAX_W
-            VIDEO_MAX_H=$MAX_VIDEO_MAX_H    AUDIO_BITRATE=$MAX_AUDIO_BITRATE
-            REENCODE_ALL_VIDEO=$MAX_REENCODE_ALL_VIDEO ;;
+            JPEG_QUALITY=$MAX_JPEG_QUALITY  IMG_MAX_DIM=$MAX_IMG_MAX_DIM
+            VIDEO_CRF=$MAX_VIDEO_CRF        VIDEO_PRESET=$MAX_VIDEO_PRESET
+            VIDEO_MAX_W=$MAX_VIDEO_MAX_W    VIDEO_MAX_H=$MAX_VIDEO_MAX_H
+            AUDIO_BITRATE=$MAX_AUDIO_BITRATE REENCODE_ALL_VIDEO=$MAX_REENCODE_ALL_VIDEO ;;
     esac
 
     # Apply individual overrides
     [[ -n "$ov_jpeg_quality" ]] && JPEG_QUALITY="$ov_jpeg_quality"
-    [[ -n "$ov_png_comp"     ]] && PNG_COMPRESSION="$ov_png_comp"
     [[ -n "$ov_img_max_dim"  ]] && IMG_MAX_DIM="$ov_img_max_dim"
     [[ -n "$ov_crf"          ]] && VIDEO_CRF="$ov_crf"
     [[ -n "$ov_preset"       ]] && VIDEO_PRESET="$ov_preset"
     [[ -n "$ov_max_w"        ]] && VIDEO_MAX_W="$ov_max_w"
     [[ -n "$ov_max_h"        ]] && VIDEO_MAX_H="$ov_max_h"
     [[ -n "$ov_audio"        ]] && AUDIO_BITRATE="$ov_audio"
+    if [[ -n "$ov_min_photo_mb" ]]; then
+        [[ "$ov_min_photo_mb" =~ ^[0-9]+$ ]] || fail "--min-photo-mb must be an integer"
+        MIN_PHOTO_BYTES=$(( ov_min_photo_mb * 1024 * 1024 ))
+    fi
+    if [[ -n "$ov_min_video_mb" ]]; then
+        [[ "$ov_min_video_mb" =~ ^[0-9]+$ ]] || fail "--min-video-mb must be an integer"
+        MIN_VIDEO_BYTES=$(( ov_min_video_mb * 1024 * 1024 ))
+    fi
 
     # Validate
     [[ "$JPEG_QUALITY"    =~ ^[0-9]+$ ]] || fail "--jpeg-quality must be an integer"
-    [[ "$PNG_COMPRESSION" =~ ^[0-9]+$ ]] || fail "--png-compression must be an integer"
     [[ "$IMG_MAX_DIM"     =~ ^[0-9]+$ ]] || fail "--max-image-dim must be an integer"
     [[ "$VIDEO_CRF"       =~ ^[0-9]+$ ]] || fail "--crf must be an integer"
     [[ "$VIDEO_MAX_W"     =~ ^[0-9]+$ ]] || fail "--max-width must be an integer"
@@ -662,8 +676,10 @@ main() {
     printf 'Level       : %s\n' "$level"
     [[ -n "$FILTER_EXTS" ]] && printf 'Only exts   : %s\n' "$FILTER_EXTS"
     [[ -n "$SKIP_EXTS"   ]] && printf 'Skip exts   : %s\n' "$SKIP_EXTS"
-    printf 'Settings    : JPEG %d  PNG-comp %d  max-dim %dpx  CRF %d  preset %s  %dx%d  audio %s\n' \
-        "$JPEG_QUALITY" "$PNG_COMPRESSION" "$IMG_MAX_DIM" \
+    (( MIN_PHOTO_BYTES > 0 )) && printf 'Min photo   : %d MB (skip smaller)\n' "$(( MIN_PHOTO_BYTES / 1024 / 1024 ))"
+    (( MIN_VIDEO_BYTES > 0 )) && printf 'Min video   : %d MB (skip smaller)\n' "$(( MIN_VIDEO_BYTES / 1024 / 1024 ))"
+    printf 'Settings    : JPEG/PNG %d  max-dim %dpx  CRF %d  preset %s  %dx%d  audio %s\n' \
+        "$JPEG_QUALITY" "$IMG_MAX_DIM" \
         "$VIDEO_CRF" "$VIDEO_PRESET" "$VIDEO_MAX_W" "$VIDEO_MAX_H" "$AUDIO_BITRATE"
     echo "============================================"
     echo
@@ -699,16 +715,33 @@ main() {
     print_top_savings "$STATS_DIR"
 
     echo
-    echo "Disk usage (du -sh):"
-    if (( ! skip_copy )); then
-        du -sh "$src_abs" "$dest_abs"
-    else
-        du -sh "$dest_abs"
-    fi
-    echo
     echo "Done."
     echo "  Optimized copy : $dest_abs"
     (( ! skip_copy )) && echo "  Original       : $src_abs  (untouched)"
+
+    # Final folder statistics
+    local stats_script
+    stats_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../statistics/folder_stats.sh"
+    if [[ -x "$stats_script" ]]; then
+        if (( ! skip_copy )); then
+            echo
+            echo "============================================"
+            echo "Folder stats: original"
+            echo "============================================"
+            "$stats_script" "$src_abs"
+            echo
+            echo "============================================"
+            echo "Folder stats: optimized copy"
+            echo "============================================"
+            "$stats_script" "$dest_abs"
+        else
+            echo
+            echo "============================================"
+            echo "Folder stats"
+            echo "============================================"
+            "$stats_script" "$dest_abs"
+        fi
+    fi
 }
 
 main "$@"

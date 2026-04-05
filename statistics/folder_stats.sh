@@ -109,17 +109,24 @@ print_problematic_files() {
 }
 
 print_largest_files() {
-    local target="$1"
-    local limit="$2"
+    local target="$1" limit="$2" photo_mb="$3" video_mb="$4"
+    local photo_bytes=$(( photo_mb * 1024 * 1024 ))
+    local video_bytes=$(( video_mb * 1024 * 1024 ))
     echo
-    echo "Top $limit largest files:"
-    find "$target" -type f -printf '%s\t%p\n' | sort -nr | head -n "$limit" | \
-        awk '{
-            split("B KB MB GB TB", unit);
-            asize=$1;
-            u=1;
-            while(asize>=1024 && u<5){asize/=1024;u++}
-            printf "  %-6.1f %s  %s\n", asize, unit[u], $2
+    echo "Top $limit largest files (photos > ${photo_mb} MB, videos > ${video_mb} MB):"
+    find "$target" -type f -printf '%s\t%p\n' | sort -t$'\t' -k1,1nr | \
+        awk -F'\t' -v pb="$photo_bytes" -v vb="$video_bytes" -v lim="$limit" '
+        count >= lim { exit }
+        {
+            sz = $1 + 0; path = $2
+            ext = tolower(path); sub(/.*\./, "", ext)
+            if (ext ~ /^(jpg|jpeg|png|webp)$/ && sz < pb) next
+            if (ext ~ /^(mp4|mkv|avi|m4v|webm|mpg|mpeg|mov)$/ && sz < vb) next
+            if (sz >= 1073741824)      printf "  %6.1f GB  %s\n", sz/1073741824, path
+            else if (sz >= 1048576)    printf "  %6.1f MB  %s\n", sz/1048576, path
+            else if (sz >= 1024)       printf "  %6.1f KB  %s\n", sz/1024, path
+            else                       printf "  %6d  B   %s\n", sz, path
+            count++
         }'
 }
 
@@ -188,7 +195,7 @@ main() {
     echo "Analyzing: $(realpath "$target_dir")"
     echo
     print_directory_usage "$target_dir" "$depth"
-    print_largest_files "$target_dir" "$top_files"
+    print_largest_files "$target_dir" "$top_files" "$photo_mb" "$video_mb"
     print_problematic_files "$target_dir" "$photo_mb" "$video_mb"
 
     echo
