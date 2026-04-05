@@ -8,7 +8,6 @@
 #   3. Prints a savings report with top files
 #
 # Supported formats:
-#   HEIC/HEIF  → JPEG (always — huge savings, opens everywhere)
 #   MOV        → MP4 H.264 + AAC (always — plays everywhere)
 #   JPEG/WEBP  → recompressed (strip EXIF, slightly lower quality)
 #   PNG        → lossless recompression (strip EXIF)
@@ -19,25 +18,25 @@ set -euo pipefail
 # ── Level presets ────────────────────────────────────────────────────────────
 # archive: convert formats only, near-lossless quality
 readonly ARC_JPEG_QUALITY=95   ARC_PNG_COMPRESSION=6  ARC_IMG_MAX_DIM=99999
-readonly ARC_VIDEO_CRF=18      ARC_VIDEO_PRESET="slow"
+readonly ARC_VIDEO_CRF=20      ARC_VIDEO_PRESET="slow"
 readonly ARC_VIDEO_MAX_W=3840  ARC_VIDEO_MAX_H=2160   ARC_AUDIO_BITRATE="256k"
 readonly ARC_REENCODE_ALL_VIDEO=0
 
 # moderate: safe everyday optimization, loss barely noticeable
 readonly MOD_JPEG_QUALITY=88   MOD_PNG_COMPRESSION=7  MOD_IMG_MAX_DIM=8000
-readonly MOD_VIDEO_CRF=23      MOD_VIDEO_PRESET="medium"
+readonly MOD_VIDEO_CRF=25      MOD_VIDEO_PRESET="medium"
 readonly MOD_VIDEO_MAX_W=3840  MOD_VIDEO_MAX_H=2160   MOD_AUDIO_BITRATE="192k"
-readonly MOD_REENCODE_ALL_VIDEO=0
+readonly MOD_REENCODE_ALL_VIDEO=1
 
 # aggressive: visible savings, quality still acceptable
 readonly AGG_JPEG_QUALITY=80   AGG_PNG_COMPRESSION=9  AGG_IMG_MAX_DIM=3840
-readonly AGG_VIDEO_CRF=26      AGG_VIDEO_PRESET="medium"
+readonly AGG_VIDEO_CRF=28      AGG_VIDEO_PRESET="medium"
 readonly AGG_VIDEO_MAX_W=1920  AGG_VIDEO_MAX_H=1080   AGG_AUDIO_BITRATE="192k"
 readonly AGG_REENCODE_ALL_VIDEO=1
 
 # maximum: max space savings, noticeable quality loss
 readonly MAX_JPEG_QUALITY=70   MAX_PNG_COMPRESSION=9  MAX_IMG_MAX_DIM=2560
-readonly MAX_VIDEO_CRF=28      MAX_VIDEO_PRESET="medium"
+readonly MAX_VIDEO_CRF=32      MAX_VIDEO_PRESET="medium"
 readonly MAX_VIDEO_MAX_W=1280  MAX_VIDEO_MAX_H=720    MAX_AUDIO_BITRATE="128k"
 readonly MAX_REENCODE_ALL_VIDEO=1
 
@@ -47,23 +46,24 @@ usage() {
 Usage: media_optimize.sh [OPTIONS] SOURCE_DIR [DESTINATION_DIR]
 
 Creates an optimized copy of SOURCE_DIR. Originals are never modified.
-Default destination: SOURCE_DIR_optimized
+Default destination: SOURCE_DIR_<level>  (e.g. Photos_aggressive)
 
 Options:
   --level LEVEL                Level of optimization (default: moderate)
-  --only-exts EXT[,EXT,...]   Process only these extensions, e.g. heic,mov,jpg
+  --only-exts EXT[,EXT,...]   Process only these extensions, e.g. mov,jpg,png
+  --skip-exts EXT[,EXT,...]   Skip these extensions, e.g. mp4,mkv
   --dry-run                   Show estimated savings per type, make no changes
   --skip-copy                 Skip rsync step; optimize an already-copied directory
   --log FILE                  Append all output to FILE and terminal
-  --jobs N                    Parallel workers for photo/HEIC/video processing (default: 1)
+  --jobs N                    Parallel workers for photo/video processing (default: 1)
   -h, --help                  Show this help
 
 Levels (--level):
-  archive    Near-lossless. Only converts formats (HEIC→JPEG, MOV→MP4).
+  archive    Near-lossless. Only converts formats (MOV→MP4).
              JPEG 95, no resize, CRF 18 slow 4K. Good for precious originals.
 
   moderate   Safe optimization. Loss barely noticeable. (default)
-             JPEG 88, max 8000px, CRF 23 medium 4K. Skips existing MP4/MKV.
+             JPEG 88, max 8000px, CRF 23 medium 4K. Re-encodes all video.
 
   aggressive Strong compression. Quality still acceptable for everyday use.
              JPEG 80, max 3840px, CRF 26 medium 1080p. Re-encodes MP4/MKV too.
@@ -71,13 +71,13 @@ Levels (--level):
   maximum    Maximum space savings. Noticeable quality loss.
              JPEG 70, max 2560px, CRF 28 medium 720p. Re-encodes everything.
 
-Extension filter (--only-exts):
-  Process only the listed extensions. Useful to run just one pass at a time.
+Extension filters:
+  --only-exts and --skip-exts are mutually exclusive.
   Examples:
-    --only-exts heic           only convert iPhone photos
-    --only-exts mov            only convert iPhone videos
-    --only-exts jpg,jpeg,png   only optimize still images
-    --only-exts heic,mov       iPhone formats only
+    --only-exts mov              only convert videos
+    --only-exts jpg,jpeg,png     only optimize photos
+    --skip-exts mp4,mkv,avi      skip all video re-encoding
+    --skip-exts mov              skip MOV conversion
 
 Quality overrides (applied on top of --level, for fine-tuning):
   --jpeg-quality N     JPEG/WEBP quality 1-100
@@ -93,10 +93,10 @@ Examples:
   media_optimize.sh /media/usb/Photos
   media_optimize.sh --level aggressive /media/usb/Photos /media/usb/Photos_opt
   media_optimize.sh --dry-run --level aggressive /media/usb/Photos
-  media_optimize.sh --only-exts heic,mov /media/usb/Photos
-  media_optimize.sh --level archive --only-exts heic /media/usb/Photos
+  media_optimize.sh --only-exts mov,jpg,jpeg /media/usb/Photos
+  media_optimize.sh --skip-exts mp4,mkv /media/usb/Photos
   media_optimize.sh --log ~/opt.log --jobs 4 /media/usb/Photos
-  media_optimize.sh --skip-copy --level aggressive /media/usb/Photos_optimized
+  media_optimize.sh --skip-copy --level aggressive /media/usb/Photos_aggressive
 EOF
 }
 
@@ -141,7 +141,7 @@ check_free_space() {
     # Estimate output size based on level (conservative but realistic)
     local ratio
     case "$level" in
-        archive)    ratio=115 ;;  # HEIC→JPEG can grow; use 115% of source
+        archive)    ratio=100 ;;
         moderate)   ratio=85  ;;
         aggressive) ratio=60  ;;
         maximum)    ratio=45  ;;
@@ -159,57 +159,34 @@ check_free_space() {
 }
 
 # ── Extension filter ──────────────────────────────────────────────────────────
-FILTER_EXTS=""   # empty = allow all
+FILTER_EXTS=""   # --only-exts: empty = allow all
+SKIP_EXTS=""     # --skip-exts: empty = skip nothing
 
 ext_allowed() {
     local ext="${1,,}"
+    local IFS=',' e
+    if [[ -n "$SKIP_EXTS" ]]; then
+        for e in $SKIP_EXTS; do [[ "${e,,}" == "$ext" ]] && return 1; done
+        return 0
+    fi
     [[ -z "$FILTER_EXTS" ]] && return 0
-    local IFS=','
-    local e
-    for e in $FILTER_EXTS; do
-        [[ "${e,,}" == "$ext" ]] && return 0
-    done
+    for e in $FILTER_EXTS; do [[ "${e,,}" == "$ext" ]] && return 0; done
     return 1
 }
 
 # ── Image tool ────────────────────────────────────────────────────────────────
 # Stored as array to avoid word-split issues with paths containing spaces
 IMGCMD=()
-# HEIC_TOOL: "pillow" | "imagemagick"
-HEIC_TOOL=""
 init_image_tool() {
-    if command -v magick >/dev/null 2>&1 && magick -list format 2>/dev/null | grep -qi heic; then
+    if command -v magick >/dev/null 2>&1; then
         IMGCMD=(magick convert)
     elif command -v convert >/dev/null 2>&1 && convert --version 2>&1 | grep -qi imagemagick; then
         IMGCMD=(convert)
-    elif command -v magick >/dev/null 2>&1; then
-        IMGCMD=(magick convert)
     else
         fail "ImageMagick (magick or convert) is required for photo processing."
     fi
-
-    # Prefer pillow-heif for HEIC: handles files that libheif 1.17 cannot
-    if python3 -c "import pillow_heif" 2>/dev/null; then
-        HEIC_TOOL="pillow"
-    else
-        HEIC_TOOL="imagemagick"
-    fi
 }
 run_convert() { "${IMGCMD[@]}" "$@"; }
-
-# Convert one HEIC file to JPEG using pillow-heif (handles auxiliary image refs)
-heif_to_jpeg_pillow() {
-    local src="$1" dst="$2" quality="$3"
-    python3 -c "
-import sys, pillow_heif
-from PIL import Image
-pillow_heif.register_heif_opener()
-img = Image.open(sys.argv[1])
-if img.mode not in ('RGB', 'L'):
-    img = img.convert('RGB')
-img.save(sys.argv[2], format='JPEG', quality=int(sys.argv[3]), optimize=True)
-" "$src" "$dst" "$quality"
-}
 
 # ── Temp file cleanup ─────────────────────────────────────────────────────────
 STATS_DIR=""
@@ -231,7 +208,7 @@ wait_for_slot() {
 # ── File collection ───────────────────────────────────────────────────────────
 # Single find pass — avoids re-reading the directory tree multiple times.
 # Sets globals (must be declared local -a by the caller):
-#   heic_files  heic_sizes   img_files  img_sizes
+#   img_files  img_sizes
 #   video_primary  video_primary_sizes   video_other  video_other_sizes
 #   skipped_vid  skipped_vid_sizes
 #
@@ -247,8 +224,6 @@ collect_media_files() {
         _ext="${_path##*.}"; _ext="${_ext,,}"
         ext_allowed "$_ext" || continue
         case "$_ext" in
-            heic|heif)
-                heic_files+=("$_path"); heic_sizes+=("$_sz") ;;
             jpg|jpeg|png|webp)
                 img_files+=("$_path"); img_sizes+=("$_sz") ;;
             mov)
@@ -283,7 +258,7 @@ optimize_photo() {
     local sz_before sz_after
     sz_before=$(stat -c%s -- "$file")
 
-    if run_convert -auto-orient -strip \
+    if run_convert -auto-orient +profile "!exif,*" \
         -resize "${IMG_MAX_DIM}x${IMG_MAX_DIM}>" \
         "${extra_args[@]}" "$file" "$tmp" 2>/dev/null; then
         sz_after=$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)
@@ -295,40 +270,6 @@ optimize_photo() {
     fi
     rm -f "$tmp"
     printf 'photo|%s|%d|%d\n' "$rel" "$sz_before" "$sz_before" > "$stats_file"
-}
-
-# Convert HEIC/HEIF → JPEG. Writes result to $stats_file.
-convert_heic() {
-    local file="$1" rel="$2" stats_file="$3"
-    local dst="${file%.*}.jpg"
-    local tmp="${dst}.opt.${BASHPID}"
-
-    if [[ -f "$dst" ]]; then
-        printf 'heic|%s|0|0|skip\n' "$rel" > "$stats_file"
-        return
-    fi
-
-    local sz_before sz_after
-    sz_before=$(stat -c%s -- "$file")
-
-    local ok=0
-    if [[ "$HEIC_TOOL" == "pillow" ]]; then
-        heif_to_jpeg_pillow "$file" "$tmp" "$JPEG_QUALITY" 2>/dev/null && ok=1
-    else
-        run_convert -auto-orient -strip -quality "$JPEG_QUALITY" "$file" "$tmp" 2>/dev/null && ok=1
-    fi
-
-    if (( ok )); then
-        sz_after=$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)
-        if (( sz_after > 0 )); then
-            mv "$tmp" "$dst"
-            rm -f "$file"
-            printf 'heic|%s|%d|%d\n' "$rel" "$sz_before" "$sz_after" > "$stats_file"
-            return
-        fi
-    fi
-    rm -f "$tmp"
-    printf 'heic|%s|%d|%d|fail\n' "$rel" "$sz_before" "$sz_before" > "$stats_file"
 }
 
 # Convert video → MP4. Renames if source is not .mp4. Writes result to $stats_file.
@@ -402,18 +343,11 @@ print_top_savings() {
 # ── Summary ───────────────────────────────────────────────────────────────────
 print_summary() {
     local stats_dir="$1" elapsed="$2"
-    local heic_ok=0 heic_before=0 heic_after=0 heic_fail=0 heic_skip=0
     local photo_ok=0 photo_before=0 photo_after=0 photo_fail=0
     local video_ok=0 video_before=0 video_after=0 video_fail=0
 
     while IFS='|' read -r type rel before after rest; do
         case "$type" in
-            heic)
-                case "${rest:-}" in
-                    skip) (( ++heic_skip )) ;;
-                    fail) (( ++heic_fail )) ;;
-                    *) heic_before=$(( heic_before+before )); heic_after=$(( heic_after+after )); (( ++heic_ok )) ;;
-                esac ;;
             photo)
                 case "${rest:-}" in
                     fail) (( ++photo_fail )) ;;
@@ -427,26 +361,22 @@ print_summary() {
         esac
     done < <(cat "$stats_dir"/*.result 2>/dev/null || true)
 
-    local total_before=$(( heic_before+photo_before+video_before ))
-    local total_after=$(( heic_after+photo_after+video_after ))
-    local total_fail=$(( heic_fail+photo_fail+video_fail ))
+    local total_before=$(( photo_before+video_before ))
+    local total_after=$(( photo_after+video_after ))
+    local total_fail=$(( photo_fail+video_fail ))
 
     echo
     echo "=== Optimization Summary ==="
-    # Only print rows that had actual files processed
-    (( heic_ok  > 0 || heic_fail  > 0 )) && printf '%-8s  %5d files  %12s → %12s  %s\n' \
-        "HEIC"   "$heic_ok"  "$(format_bytes "$heic_before")"  "$(format_bytes "$heic_after")"  "$(format_percent "$heic_before"  "$heic_after")"
     (( photo_ok > 0 || photo_fail > 0 )) && printf '%-8s  %5d files  %12s → %12s  %s\n' \
         "Photos" "$photo_ok" "$(format_bytes "$photo_before")" "$(format_bytes "$photo_after")" "$(format_percent "$photo_before" "$photo_after")"
     (( video_ok > 0 || video_fail > 0 )) && printf '%-8s  %5d files  %12s → %12s  %s\n' \
         "Videos" "$video_ok" "$(format_bytes "$video_before")" "$(format_bytes "$video_after")" "$(format_percent "$video_before" "$video_after")"
     echo "──────────────────────────────────────────────────────────────────"
     printf '%-8s  %5d files  %12s → %12s  %s\n' \
-        "Total" "$(( heic_ok+photo_ok+video_ok ))" \
+        "Total" "$(( photo_ok+video_ok ))" \
         "$(format_bytes "$total_before")" "$(format_bytes "$total_after")" \
         "$(format_percent "$total_before" "$total_after")"
     printf 'Elapsed : %s\n' "$(format_elapsed "$elapsed")"
-    (( heic_skip  > 0 )) && printf 'Skipped : %d HEIC (target .jpg already existed)\n' "$heic_skip"
     (( total_fail > 0 )) && printf 'Failed  : %d file(s) — originals preserved in copy\n' "$total_fail" >&2
 }
 
@@ -455,32 +385,15 @@ run_optimization() {
     local dest="$1"
     local idx
 
-    local -a heic_files=() heic_sizes=()
     local -a img_files=() img_sizes=()
     local -a video_primary=() video_primary_sizes=()
     local -a video_other=() video_other_sizes=()
     local -a skipped_vid=() skipped_vid_sizes=()
     collect_media_files "$dest"
 
-    printf 'Found: %d HEIC, %d photos, %d videos to process\n' \
-        "${#heic_files[@]}" "${#img_files[@]}" "$(( ${#video_primary[@]} + ${#video_other[@]} ))"
+    printf 'Found: %d photos, %d videos to process\n' \
+        "${#img_files[@]}" "$(( ${#video_primary[@]} + ${#video_other[@]} ))"
     echo
-
-    # HEIC → JPEG
-    if (( ${#heic_files[@]} > 0 )); then
-        printf -- '--- HEIC/HEIF → JPEG  (quality=%d) ---\n' "$JPEG_QUALITY"
-        idx=0
-        for file in "${heic_files[@]}"; do
-            (( ++idx ))
-            local rel="${file#$dest/}"
-            printf '[%d/%d] %s\n' "$idx" "${#heic_files[@]}" "$rel"
-            local sf="$STATS_DIR/heic_${idx}.result"
-            wait_for_slot
-            local _f="$file" _r="$rel" _sf="$sf"
-            { convert_heic "$_f" "$_r" "$_sf"; } &
-        done
-        wait; echo
-    fi
 
     # Photos
     if (( ${#img_files[@]} > 0 )); then
@@ -525,7 +438,6 @@ run_dry_run() {
     echo "Savings estimates are approximate (typical values, actual depends on content)."
     echo
 
-    local -a heic_files=() heic_sizes=()
     local -a img_files=() img_sizes=()
     local -a video_primary=() video_primary_sizes=()
     local -a video_other=() video_other_sizes=()
@@ -534,49 +446,43 @@ run_dry_run() {
     echo
 
     # Estimated savings ratios (%) by level.
-    # Positive = savings (file gets smaller). Negative = growth (file gets larger).
-    local heic_ratio img_ratio vid_ratio other_ratio
+    local img_ratio vid_ratio other_ratio
     case "$LEVEL" in
-        archive)    heic_ratio=-40; img_ratio=-5;  vid_ratio=15; other_ratio=0  ;;
-        moderate)   heic_ratio=0;   img_ratio=12;  vid_ratio=30; other_ratio=0  ;;
-        aggressive) heic_ratio=15;  img_ratio=22;  vid_ratio=50; other_ratio=35 ;;
-        maximum)    heic_ratio=40;  img_ratio=35;  vid_ratio=65; other_ratio=55 ;;
+        archive)    img_ratio=-5;  vid_ratio=15; other_ratio=0  ;;
+        moderate)   img_ratio=12;  vid_ratio=30; other_ratio=0  ;;
+        aggressive) img_ratio=22;  vid_ratio=50; other_ratio=35 ;;
+        maximum)    img_ratio=35;  vid_ratio=65; other_ratio=55 ;;
     esac
 
     # Sum sizes from arrays collected during scan — no stat calls needed
-    local heic_sz=0 img_sz=0 vid_sz=0 other_sz=0 skipped_sz=0
+    local img_sz=0 vid_sz=0 other_sz=0 skipped_sz=0
     local _s
-    for _s in "${heic_sizes[@]+"${heic_sizes[@]}"}";          do (( heic_sz    += _s )); done
     for _s in "${img_sizes[@]+"${img_sizes[@]}"}";            do (( img_sz     += _s )); done
     for _s in "${video_primary_sizes[@]+"${video_primary_sizes[@]}"}"; do (( vid_sz += _s )); done
     for _s in "${video_other_sizes[@]+"${video_other_sizes[@]}"}";  do (( other_sz  += _s )); done
     for _s in "${skipped_vid_sizes[@]+"${skipped_vid_sizes[@]}"}";  do (( skipped_sz += _s )); done
 
     # Compute all estimated sizes in one Python call
-    local heic_est img_est vid_est other_est
-    read -r heic_est img_est vid_est other_est < <(python3 - \
-        "$heic_sz" "$heic_ratio" "$img_sz" "$img_ratio" \
-        "$vid_sz"  "$vid_ratio"  "$other_sz" "$other_ratio" <<'PY'
+    local img_est vid_est other_est
+    read -r img_est vid_est other_est < <(python3 - \
+        "$img_sz" "$img_ratio" "$vid_sz" "$vid_ratio" "$other_sz" "$other_ratio" <<'PY'
 import sys
 a = sys.argv[1:]
 out = []
-for i in range(0, 8, 2):
+for i in range(0, 6, 2):
     total, ratio = int(a[i]), float(a[i+1])
     out.append(str(int(total * (1 - ratio / 100))))
 print(' '.join(out))
 PY
 )
 
-    local total_before=$(( heic_sz + img_sz + vid_sz + other_sz ))
-    local total_after=$(( heic_est + img_est + vid_est + other_est ))
+    local total_before=$(( img_sz + vid_sz + other_sz ))
+    local total_after=$(( img_est + vid_est + other_est ))
 
     printf 'Level       : %s\n' "$LEVEL"
-    [[ -n "$FILTER_EXTS" ]] && printf 'Extensions  : %s\n' "$FILTER_EXTS"
+    [[ -n "$FILTER_EXTS" ]] && printf 'Only exts   : %s\n' "$FILTER_EXTS"
+    [[ -n "$SKIP_EXTS"   ]] && printf 'Skip exts   : %s\n' "$SKIP_EXTS"
     echo
-    printf '%-10s  %5s files  %12s → %12s  ~%s\n' \
-        "HEIC→JPEG" "${#heic_files[@]}" \
-        "$(format_bytes "$heic_sz")" "$(format_bytes "$heic_est")" \
-        "$(format_percent "$heic_sz" "$heic_est")"
     printf '%-10s  %5s files  %12s → %12s  ~%s\n' \
         "Photos" "${#img_files[@]}" \
         "$(format_bytes "$img_sz")" "$(format_bytes "$img_est")" \
@@ -593,7 +499,7 @@ PY
     fi
     echo "──────────────────────────────────────────────────────────────────"
     printf '%-10s  %5s files  %12s → %12s  ~%s\n' \
-        "Total" "$(( ${#heic_files[@]} + ${#img_files[@]} + ${#video_primary[@]} + ${#video_other[@]} ))" \
+        "Total" "$(( ${#img_files[@]} + ${#video_primary[@]} + ${#video_other[@]} ))" \
         "$(format_bytes "$total_before")" "$(format_bytes "$total_after")" \
         "$(format_percent "$total_before" "$total_after")"
 
@@ -624,6 +530,8 @@ main() {
             --level=*)           level="${1#--level=}"; shift ;;
             --only-exts)         [[ $# -ge 2 ]] || fail "--only-exts requires a value"; FILTER_EXTS="$2"; shift 2 ;;
             --only-exts=*)       FILTER_EXTS="${1#--only-exts=}"; shift ;;
+            --skip-exts)         [[ $# -ge 2 ]] || fail "--skip-exts requires a value"; SKIP_EXTS="$2"; shift 2 ;;
+            --skip-exts=*)       SKIP_EXTS="${1#--skip-exts=}"; shift ;;
             --jobs)              [[ $# -ge 2 ]] || fail "--jobs requires a value"; PARALLEL_JOBS="$2"; shift 2 ;;
             --jobs=*)            PARALLEL_JOBS="${1#--jobs=}"; shift ;;
             --log)               [[ $# -ge 2 ]] || fail "--log requires a value"; log_file="$2"; shift 2 ;;
@@ -651,6 +559,7 @@ main() {
     done
 
     [[ ${#positional[@]} -ge 1 ]] || { usage; exit 1; }
+    [[ -n "$FILTER_EXTS" && -n "$SKIP_EXTS" ]] && fail "--only-exts and --skip-exts are mutually exclusive"
     case "$level" in
         archive|moderate|aggressive|maximum) ;;
         *) fail "--level must be: archive, moderate, aggressive, or maximum" ;;
@@ -718,7 +627,7 @@ main() {
     else
         source_dir="${positional[0]}"
         dest_dir="${positional[1]:-}"
-        [[ -z "$dest_dir" ]] && dest_dir="${source_dir%/}_optimized"
+        [[ -z "$dest_dir" ]] && dest_dir="${source_dir%/}_${level}"
     fi
     [[ -d "$source_dir" ]] || fail "Source directory '$source_dir' does not exist"
 
@@ -751,7 +660,8 @@ main() {
         printf 'Destination : %s\n' "$dest_abs"
     fi
     printf 'Level       : %s\n' "$level"
-    [[ -n "$FILTER_EXTS" ]] && printf 'Extensions  : %s\n' "$FILTER_EXTS"
+    [[ -n "$FILTER_EXTS" ]] && printf 'Only exts   : %s\n' "$FILTER_EXTS"
+    [[ -n "$SKIP_EXTS"   ]] && printf 'Skip exts   : %s\n' "$SKIP_EXTS"
     printf 'Settings    : JPEG %d  PNG-comp %d  max-dim %dpx  CRF %d  preset %s  %dx%d  audio %s\n' \
         "$JPEG_QUALITY" "$PNG_COMPRESSION" "$IMG_MAX_DIM" \
         "$VIDEO_CRF" "$VIDEO_PRESET" "$VIDEO_MAX_W" "$VIDEO_MAX_H" "$AUDIO_BITRATE"

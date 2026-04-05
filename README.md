@@ -2,10 +2,10 @@
 
 ## What's in this repository
 
-| Command    | Script                       | What it does                                                                                      |
-|------------|------------------------------|---------------------------------------------------------------------------------------------------|
+| Command    | Script                       | What it does                                                                                       |
+|------------|------------------------------|----------------------------------------------------------------------------------------------------|
 | `optimize` | `personal/media_optimize.sh` | Copies a folder and optimizes the copy. Levels: `archive` / `moderate` / `aggressive` / `maximum` |
-| `stats`    | `statistics/folder_stats.sh` | Disk statistics: folder sizes and largest files                                                   |
+| `stats`    | `statistics/folder_stats.sh` | Disk statistics: folder sizes, largest files, and files that need compression                      |
 
 All commands are run via `./run.sh <command>`.
 
@@ -14,14 +14,14 @@ All commands are run via `./run.sh <command>`.
 ## `optimize` — media archive optimization
 
 Makes an rsync copy of SOURCE_DIR and optimizes it. The original is never touched.
+The destination folder is named automatically: `SOURCE_DIR_<level>` (e.g. `Photos_aggressive`).
 
-**Formats:**
+**Formats processed:**
 
-- HEIC/HEIF → JPEG (always — ~50–70% savings, opens everywhere)
 - MOV → MP4 H.264 + AAC (always — plays everywhere)
-- JPEG, WEBP → recompressed (strip EXIF, slight quality reduction)
-- PNG → lossless recompression (strip EXIF)
-- MP4/MKV/AVI → only at `--level aggressive` and `--level maximum`
+- JPEG, WEBP → recompressed, EXIF preserved (date, GPS, camera)
+- PNG → lossless recompression, EXIF preserved
+- MP4/MKV/AVI → re-encoded at `moderate`, `aggressive`, `maximum`
 
 ### Levels
 
@@ -29,34 +29,41 @@ Makes an rsync copy of SOURCE_DIR and optimizes it. The original is never touche
 |----------------|-----------------|----------------------|-------------------------|------------------------|
 | JPEG quality   | 95              | 88                   | 80                      | 70                     |
 | Max photo size | no limit        | 8000px               | 3840px                  | 2560px                 |
-| MOV → MP4      | CRF 18, 4K slow | CRF 23, 4K           | CRF 26, 1080p           | CRF 28, 720p           |
-| MP4/MKV/AVI    | skip            | skip                 | re-encode CRF 26, 1080p | re-encode CRF 28, 720p |
+| MOV → MP4      | CRF 20, 4K slow | CRF 25, 4K           | CRF 28, 1080p           | CRF 32, 720p           |
+| MP4/MKV/AVI    | skip            | re-encode CRF 25, 4K | re-encode CRF 28, 1080p | re-encode CRF 32, 720p |
 
 ### Examples
 
 ```bash
-# Default (moderate) optimization
+# Default (moderate): optimize with good quality, all video re-encoded
 ./run.sh optimize /media/usb/Photos
 
-# Aggressive — maximum savings
-./run.sh optimize --level aggressive /media/usb/Photos /media/usb/Photos_opt
+# Aggressive: maximum savings, quality still fine for personal archive
+./run.sh optimize --level aggressive /media/usb/Photos
 
-# Preview without making changes
+# Specify destination manually
+./run.sh optimize --level aggressive /media/usb/Photos /media/usb/Photos_backup
+
+# Preview estimated savings without making changes
 ./run.sh optimize --dry-run --level aggressive /media/usb/Photos
 
-# Fine-tune on top of a level
-./run.sh optimize --level moderate --crf 20 --preset slow /media/usb/Photos
-./run.sh optimize --jpeg-quality 92 --max-image-dim 6000 /media/usb/Photos
+# Continue after interrupted run (skip rsync, re-run optimization only)
+./run.sh optimize --skip-copy --level aggressive /media/usb/Photos_aggressive
 
-# Save log + parallel photo processing
-./run.sh optimize --log ~/opt.log --jobs 4 /media/usb/Photos
-
-# Process only specific extensions
-./run.sh optimize --only-exts heic,mov /media/usb/Photos
+# Process only specific formats
+./run.sh optimize --only-exts mov /media/usb/Photos
 ./run.sh optimize --only-exts jpg,jpeg,png --level aggressive /media/usb/Photos
 
-# Skip rsync, optimize an already-copied directory (e.g. after interrupted run)
-./run.sh optimize --skip-copy --level aggressive /media/usb/Photos_opt
+# Skip specific formats (e.g. don't re-encode existing MP4/MKV)
+./run.sh optimize --skip-exts mp4,mkv /media/usb/Photos
+./run.sh optimize --level aggressive --skip-exts mp4,mkv,avi /media/usb/Photos
+
+# Fine-tune quality on top of a level
+./run.sh optimize --level moderate --crf 22 --preset slow /media/usb/Photos
+./run.sh optimize --level aggressive --jpeg-quality 85 /media/usb/Photos
+
+# Parallel processing + log to file
+./run.sh optimize --log ~/opt.log --jobs 4 /media/usb/Photos
 ```
 
 ### All options
@@ -64,11 +71,12 @@ Makes an rsync copy of SOURCE_DIR and optimizes it. The original is never touche
 ```
 --level LEVEL                  Optimization preset (default: moderate)
                                archive | moderate | aggressive | maximum
---only-exts EXT[,EXT,...]      Process only these extensions, e.g. heic,mov,jpg
+--only-exts EXT[,EXT,...]      Process only these extensions, e.g. mov,jpg,png
+--skip-exts EXT[,EXT,...]      Skip these extensions, e.g. mp4,mkv,avi
 --dry-run                      Show estimated savings per type, make no changes
 --skip-copy                    Skip rsync; optimize an already-copied directory
 --log FILE                     Write output to file + terminal
---jobs N                       Parallel workers for photo/HEIC/video (default: 1)
+--jobs N                       Parallel workers for photo/video (default: 1)
 
 Quality overrides (applied on top of --level):
 --jpeg-quality N      JPEG/WEBP quality (1-100)
@@ -85,20 +93,127 @@ Quality overrides (applied on top of --level):
 
 ## `stats` — disk statistics
 
-Shows folder sizes and largest files. Makes no changes.
-Useful to run before `optimize` to understand what's taking up space.
+Shows folder sizes, largest files, and a list of files that would benefit most from
+aggressive-level optimization. Makes no changes.
+
+Run this before `optimize` to understand what's taking up space and what needs compression.
 
 ```bash
-./run.sh stats /media/usb
-./run.sh stats --depth 3 --top-files 100 /media/usb
-./run.sh stats --log ~/stats.log /media/usb
+# Basic stats
+./run.sh stats /media/usb/Photos
+
+# Deeper folder breakdown + more files
+./run.sh stats --depth 3 --top-files 100 /media/usb/Photos
+
+# Custom thresholds for problematic files
+./run.sh stats --photo-mb 2 --video-mb 50 /media/usb/Photos
+
+# Save output to file
+./run.sh stats --log ~/stats.log /media/usb/Photos
 ```
 
-| Option          | Default | Env override             |
-|-----------------|---------|--------------------------|
-| `--depth N`     | `2`     | `FOLDER_STATS_DEPTH`     |
-| `--top-files K` | `50`    | `FOLDER_STATS_TOP_FILES` |
-| `--log FILE`    | off     | —                        |
+### All options
+
+| Option            | Default | Description                                              |
+|-------------------|---------|----------------------------------------------------------|
+| `--depth N`       | `2`     | Subdirectory depth for du breakdown                      |
+| `--top-files K`   | `50`    | Number of largest files to list                          |
+| `--photo-mb N`    | `4`     | Flag photos larger than N MB as needing compression      |
+| `--video-mb N`    | `80`    | Flag videos larger than N MB as needing compression      |
+| `--log FILE`      | off     | Append all output to FILE in addition to the terminal    |
+
+Environment overrides: `FOLDER_STATS_DEPTH`, `FOLDER_STATS_TOP_FILES`, `FOLDER_STATS_PHOTO_MB`, `FOLDER_STATS_VIDEO_MB`.
+
+### Example output (problematic files section)
+
+```
+Files that need aggressive compression:
+  Photos > 4 MB | Videos/MOV > 80 MB | All MOV (need conversion)
+
+  [photo   8.3 MB]  TANYA/3 лето/IMG_5466.jpg
+  [photo   6.1 MB]  TANYA/2 весна/IMG_3842.jpg
+  [MOV   312.4 MB]  TANYA/1 зима/IMG_0877.MOV
+  [video  145.1 MB]  TANYA/2 весна/long_video.mp4
+
+  Large photos :  2 files   14.4 MB
+  MOV files    :  1 files  312.4 MB
+  Large videos :  1 files  145.1 MB
+  Total        :  4 files  471.9 MB
+```
+
+---
+
+## Typical workflow
+
+```bash
+# 1. Check what's taking space and what needs compression
+./run.sh stats /media/usb/Photos
+
+# 2. Preview savings before running
+./run.sh optimize --dry-run --level aggressive /media/usb/Photos
+
+# 3. Run optimization
+./run.sh optimize --level aggressive /media/usb/Photos
+
+# 4. Verify result
+./run.sh stats /media/usb/Photos_aggressive
+```
+
+---
+
+## How to compress your archive and delete originals
+
+### Step 1 — check what you have
+
+```bash
+./run.sh stats --depth 2 /path/to/archive
+```
+
+### Step 2 — preview savings
+
+```bash
+./run.sh optimize --dry-run --level aggressive /path/to/archive
+```
+
+### Step 3 — create optimized copy
+
+```bash
+./run.sh optimize --level aggressive /path/to/archive
+# Creates /path/to/archive_aggressive. Original is not modified.
+```
+
+### Step 4 — verify the copy
+
+```bash
+# Compare file counts — must match
+find /path/to/archive -type f | wc -l
+find /path/to/archive_aggressive -type f | wc -l
+
+# Check for problematic files in the result
+./run.sh stats /path/to/archive_aggressive
+
+# Open a few photos and videos manually and check quality
+```
+
+Checklist before deleting originals:
+
+- [ ] Several photos opened normally
+- [ ] Videos play correctly
+- [ ] File counts match
+- [ ] Photo dates are preserved (check EXIF in file properties)
+- [ ] The copy is on a **different drive** or backed up to cloud
+
+### Step 5 — delete originals
+
+```bash
+rm -rf /path/to/archive
+```
+
+> **Important:** do not delete originals while the copy is on the same drive.
+> If the drive fails you lose everything. Copy to an external drive or cloud first,
+> confirm it reads correctly, then delete.
+
+If your archive is large — process it folder by folder, not all at once.
 
 ---
 
@@ -106,26 +221,20 @@ Useful to run before `optimize` to understand what's taking up space.
 
 ```bash
 sudo apt install rsync python3 imagemagick ffmpeg
-python3 -m pip install pillow-heif --break-system-packages
 ```
 
-| Tool          | Used for                                               |
-|---------------|--------------------------------------------------------|
-| `rsync`       | Copying source → destination                           |
-| `python3`     | Dry-run size estimates                                 |
-| `pillow-heif` | HEIC→JPEG conversion (handles all iPhone HEIC variants)|
-| `imagemagick` | JPEG/PNG/WEBP photo optimization                       |
-| `ffmpeg`      | MOV→MP4 conversion, video re-encoding                  |
-
-**Note on HEIC:** Ubuntu 24.04 ships with libheif 1.17.6 which fails on many iPhone HEIC files
-(`Too many auxiliary image references`). `pillow-heif` bundles a newer libheif and handles
-these files correctly. If `pillow-heif` is not installed, the script falls back to ImageMagick.
+| Tool          | Used for                              |
+|---------------|---------------------------------------|
+| `rsync`       | Copying source → destination          |
+| `python3`     | Dry-run size estimates                |
+| `imagemagick` | JPEG/PNG/WEBP photo optimization      |
+| `ffmpeg`      | MOV→MP4 conversion, video re-encoding |
 
 **Note:** `ffmpeg` is only needed if your archive contains video files (MOV, MP4, MKV, etc.).
-If you only have photos, you can skip it and use `--only-exts jpg,jpeg,png,heic` to avoid the ffmpeg check:
+If you only have photos, skip it and use `--skip-exts mov` or `--only-exts jpg,jpeg,png`:
 
 ```bash
-./run.sh optimize --only-exts jpg,jpeg,png,heic /media/usb/Photos
+./run.sh optimize --only-exts jpg,jpeg,png /media/usb/Photos
 ```
 
 All scripts print elapsed time in the final report.
