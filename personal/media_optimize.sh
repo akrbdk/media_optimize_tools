@@ -54,6 +54,8 @@ Options:
   --skip-exts EXT[,EXT,...]   Skip these extensions, e.g. mp4,mkv
   --dry-run                   Show estimated savings per type, make no changes
   --skip-copy                 Skip rsync step; optimize an already-copied directory
+  --copy-dupes DIR            Find duplicate files and copy redundant ones to DIR
+  --delete-dupes              Find duplicate files and delete redundant ones (asks confirmation)
   --log FILE                  Append all output to FILE and terminal
   --jobs N                    Parallel workers for photo/video processing (default: 1)
   -h, --help                  Show this help
@@ -98,6 +100,8 @@ Examples:
   media_optimize.sh --skip-exts mp4,mkv /media/usb/Photos
   media_optimize.sh --log ~/opt.log --jobs 4 /media/usb/Photos
   media_optimize.sh --skip-copy --level aggressive /media/usb/Photos_aggressive
+  media_optimize.sh --copy-dupes /tmp/dupes_review /media/usb/Photos
+  media_optimize.sh --delete-dupes /media/usb/Photos
 EOF
 }
 
@@ -304,7 +308,9 @@ convert_video() {
     if ffmpeg -hide_banner -loglevel warning $stats_flag -y \
         -i "$file" -vf "$scale" \
         -c:v libx264 -preset "$VIDEO_PRESET" -crf "$VIDEO_CRF" \
+        -level:v 5.2 -fps_mode vfr \
         -pix_fmt yuv420p -movflags +faststart \
+        -max_muxing_queue_size 4096 \
         -c:a aac -b:a "$AUDIO_BITRATE" "$tmp"; then
         sz_after=$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)
         if (( sz_after > 0 )); then
@@ -520,6 +526,155 @@ PY
     fi
 }
 
+# ── Duplicate management ──────────────────────────────────────────────────────
+# Finds duplicate files by MD5 hash.
+# Writes to out_file:
+#   Line 1:  STATS\t<groups>\t<dup_count>\t<dup_bytes>
+#   Lines 2+: paths of redundant files (keep first alphabetically per group)
+collect_duplicates() {
+    local target="$1" out_file="$2"
+    printf 'Scanning for duplicates in %s ...\n' "$target"
+    python3 - "$target" >"$out_file" 2>/dev/null <<'PY'
+import sys, os, hashlib, collections
+
+def md5_file(path, buf=65536):
+    h = hashlib.md5()
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                chunk = f.read(buf)
+                if not chunk: break
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+target = sys.argv[1]
+by_size = collections.defaultdict(list)
+for root, dirs, files in os.walk(target):
+    dirs.sort(); files.sort()
+    for fname in files:
+        path = os.path.join(root, fname)
+        try:
+            by_size[os.path.getsize(path)].append(path)
+        except OSError:
+            pass
+
+by_hash = collections.defaultdict(list)
+for sz, paths in by_size.items():
+    if len(paths) < 2:
+        continue
+    for path in paths:
+        h = md5_file(path)
+        if h:
+            by_hash[h].append(path)
+
+groups = 0
+dup_files = []
+for h, paths in sorted(by_hash.items()):
+    if len(paths) < 2:
+        continue
+    groups += 1
+    for path in sorted(paths)[1:]:
+        dup_files.append(path)
+
+dup_bytes = sum(os.path.getsize(p) for p in dup_files if os.path.exists(p))
+print("STATS\t{}\t{}\t{}".format(groups, len(dup_files), dup_bytes))
+for p in dup_files:
+    print(p)
+PY
+}
+
+run_copy_dupes() {
+    local target="$1" dest="$2"
+    require_command python3
+
+    local tmp_dupes; tmp_dupes=$(mktemp)
+    collect_duplicates "$target" "$tmp_dupes"
+
+    local stats_line groups dup_count dup_bytes
+    stats_line=$(head -1 "$tmp_dupes")
+    IFS=$'\t' read -r _ groups dup_count dup_bytes <<< "$stats_line"
+
+    if [[ -z "$groups" || "$groups" == "0" ]]; then
+        rm -f "$tmp_dupes"
+        echo "No duplicate files found."
+        return
+    fi
+
+    printf 'Found: %d groups, %d redundant files (%s)\n' \
+        "$groups" "$dup_count" "$(format_bytes "$dup_bytes")"
+    echo
+
+    [[ -e "$dest" ]] && fail "Destination '$dest' already exists. Remove it first."
+    mkdir -p "$dest"
+
+    local copied=0
+    local target_abs; target_abs=$(abs_path "$target")
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        local rel="${path#$target_abs/}"
+        local dst_path="$dest/$rel"
+        mkdir -p "$(dirname "$dst_path")"
+        cp -p -- "$path" "$dst_path"
+        printf '  [copy]  %s\n' "$rel"
+        (( ++copied ))
+    done < <(tail -n +2 "$tmp_dupes")
+
+    rm -f "$tmp_dupes"
+    echo
+    printf 'Copied %d redundant files to: %s\n' "$copied" "$dest"
+    echo "Review them manually, then use --delete-dupes to remove from the original."
+}
+
+run_delete_dupes() {
+    local target="$1"
+    require_command python3
+
+    local tmp_dupes; tmp_dupes=$(mktemp)
+    collect_duplicates "$target" "$tmp_dupes"
+
+    local stats_line groups dup_count dup_bytes
+    stats_line=$(head -1 "$tmp_dupes")
+    IFS=$'\t' read -r _ groups dup_count dup_bytes <<< "$stats_line"
+
+    if [[ -z "$groups" || "$groups" == "0" ]]; then
+        rm -f "$tmp_dupes"
+        echo "No duplicate files found."
+        return
+    fi
+
+    printf 'Found: %d groups, %d redundant files (%s)\n' \
+        "$groups" "$dup_count" "$(format_bytes "$dup_bytes")"
+    echo "Files to be deleted:"
+    local target_abs; target_abs=$(abs_path "$target")
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        local sz; sz=$(stat -c%s -- "$path" 2>/dev/null || echo 0)
+        printf '  [del]  %s  (%s)\n' "${path#$target_abs/}" "$(format_bytes "$sz")"
+    done < <(tail -n +2 "$tmp_dupes")
+
+    echo
+    printf 'Delete %d files and free %s? [y/N] ' "$dup_count" "$(format_bytes "$dup_bytes")"
+    local reply; read -r reply </dev/tty || reply=n
+    if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+        rm -f "$tmp_dupes"
+        echo "Aborted."
+        return
+    fi
+
+    local deleted=0
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        rm -f -- "$path"
+        (( ++deleted ))
+    done < <(tail -n +2 "$tmp_dupes")
+
+    rm -f "$tmp_dupes"
+    echo
+    printf 'Deleted %d files, freed %s.\n' "$deleted" "$(format_bytes "$dup_bytes")"
+}
+
 # ── main ──────────────────────────────────────────────────────────────────────
 main() {
     local level="moderate"
@@ -530,12 +685,16 @@ main() {
     local ov_jpeg_quality="" ov_img_max_dim=""
     local ov_crf="" ov_preset="" ov_max_w="" ov_max_h="" ov_audio=""
     local ov_min_photo_mb="" ov_min_video_mb=""
+    local copy_dupes_dir="" delete_dupes=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)           usage; exit 0 ;;
             --dry-run)           dry_run=1; shift ;;
             --skip-copy)         skip_copy=1; shift ;;
+            --copy-dupes)        [[ $# -ge 2 ]] || fail "--copy-dupes requires a directory"; copy_dupes_dir="$2"; shift 2 ;;
+            --copy-dupes=*)      copy_dupes_dir="${1#--copy-dupes=}"; shift ;;
+            --delete-dupes)      delete_dupes=1; shift ;;
             --level)             [[ $# -ge 2 ]] || fail "--level requires a value"; level="$2"; shift 2 ;;
             --level=*)           level="${1#--level=}"; shift ;;
             --only-exts)         [[ $# -ge 2 ]] || fail "--only-exts requires a value"; FILTER_EXTS="$2"; shift 2 ;;
@@ -571,6 +730,30 @@ main() {
     done
 
     [[ ${#positional[@]} -ge 1 ]] || { usage; exit 1; }
+
+    # ── Duplicate management mode (mutually exclusive with optimization) ────────
+    if [[ -n "$copy_dupes_dir" || "$delete_dupes" -eq 1 ]]; then
+        local target_abs; target_abs=$(abs_path "${positional[0]}")
+        [[ -d "$target_abs" ]] || fail "Directory '$target_abs' does not exist"
+        if [[ -n "$log_file" ]]; then
+            exec > >(tee -a "$log_file") 2>&1
+            echo "Logging to: $log_file"
+        fi
+        echo "============================================"
+        printf 'Directory : %s\n' "$target_abs"
+        echo "============================================"
+        echo
+        if [[ -n "$copy_dupes_dir" ]]; then
+            local dupes_abs; dupes_abs=$(abs_path "$copy_dupes_dir")
+            run_copy_dupes "$target_abs" "$dupes_abs"
+            echo
+        fi
+        if (( delete_dupes )); then
+            run_delete_dupes "$target_abs"
+        fi
+        exit 0
+    fi
+
     [[ -n "$FILTER_EXTS" && -n "$SKIP_EXTS" ]] && fail "--only-exts and --skip-exts are mutually exclusive"
     case "$level" in
         archive|moderate|aggressive|maximum) ;;

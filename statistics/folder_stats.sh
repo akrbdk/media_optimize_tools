@@ -19,6 +19,7 @@ Options:
   --top-files K       Show top K largest files (default: 50)
   --photo-mb N        Flag photos larger than N MB (default: 4)
   --video-mb N        Flag videos larger than N MB (default: 80)
+  --dupes             Find duplicate files by content hash (requires python3)
   --log FILE          Append all output to FILE in addition to the terminal
   -h, --help          Show this help
 EOF
@@ -108,6 +109,100 @@ print_problematic_files() {
     printf '  Total        : %d files  %.1f MB\n' "$total_count" "$(awk -v s="$total_bytes" 'BEGIN{printf "%.1f", s/1024/1024}')"
 }
 
+print_duplicate_stats() {
+    local target="$1"
+    echo
+    echo "Duplicate files (by content hash):"
+
+    require_command python3
+    local tmp_dupes
+    tmp_dupes=$(mktemp)
+
+    python3 - "$target" >"$tmp_dupes" 2>/dev/null <<'PY'
+import sys, os, hashlib, collections
+
+def md5_file(path, buf=65536):
+    h = hashlib.md5()
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                chunk = f.read(buf)
+                if not chunk: break
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+target = sys.argv[1]
+by_size = collections.defaultdict(list)
+for root, dirs, files in os.walk(target):
+    dirs.sort(); files.sort()
+    for fname in files:
+        path = os.path.join(root, fname)
+        try:
+            by_size[os.path.getsize(path)].append(path)
+        except OSError:
+            pass
+
+by_hash = collections.defaultdict(list)
+for sz, paths in by_size.items():
+    if len(paths) < 2:
+        continue
+    for path in paths:
+        h = md5_file(path)
+        if h:
+            by_hash[h].append(path)
+
+groups = 0
+dup_files = []
+for h, paths in sorted(by_hash.items()):
+    if len(paths) < 2:
+        continue
+    groups += 1
+    for path in sorted(paths)[1:]:
+        dup_files.append(path)
+
+dup_bytes = sum(os.path.getsize(p) for p in dup_files if os.path.exists(p))
+print("STATS\t{}\t{}\t{}".format(groups, len(dup_files), dup_bytes))
+for p in dup_files:
+    print(p)
+PY
+
+    if [[ ! -s "$tmp_dupes" ]]; then
+        rm -f "$tmp_dupes"
+        echo "  No duplicate files found."
+        return
+    fi
+
+    local stats_line groups dup_count dup_bytes
+    stats_line=$(head -1 "$tmp_dupes")
+    IFS=$'\t' read -r _ groups dup_count dup_bytes <<< "$stats_line"
+
+    if [[ "$groups" == "0" || -z "$groups" ]]; then
+        rm -f "$tmp_dupes"
+        echo "  No duplicate files found."
+        return
+    fi
+
+    tail -n +2 "$tmp_dupes" | while IFS= read -r path; do
+        local sz; sz=$(stat -c%s -- "$path" 2>/dev/null || echo 0)
+        printf '  [dup]  %s\n' "$path"
+    done
+
+    echo
+    printf '  Duplicate groups : %d\n' "$groups"
+    printf '  Redundant files  : %d\n' "$dup_count"
+    printf '  Wasted space     : %s\n' \
+        "$(awk -v s="$dup_bytes" 'BEGIN{
+            if (s>=1073741824) printf "%.1f GB", s/1073741824
+            else if (s>=1048576) printf "%.1f MB", s/1048576
+            else if (s>=1024) printf "%.1f KB", s/1024
+            else printf "%d B", s
+        }')"
+
+    rm -f "$tmp_dupes"
+}
+
 print_largest_files() {
     local target="$1" limit="$2" photo_mb="$3" video_mb="$4"
     local photo_bytes=$(( photo_mb * 1024 * 1024 ))
@@ -137,11 +232,14 @@ main() {
     local video_mb="$DEFAULT_VIDEO_MB"
     local log_file=""
     local target_dir=""
+    local show_dupes=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
                 usage; exit 0 ;;
+            --dupes)
+                show_dupes=1; shift ;;
             --depth)
                 [[ $# -ge 2 ]] || fail "--depth requires a value"
                 depth="$2"; shift 2 ;;
@@ -197,6 +295,7 @@ main() {
     print_directory_usage "$target_dir" "$depth"
     print_largest_files "$target_dir" "$top_files" "$photo_mb" "$video_mb"
     print_problematic_files "$target_dir" "$photo_mb" "$video_mb"
+    (( show_dupes )) && print_duplicate_stats "$target_dir"
 
     echo
     printf 'Elapsed: %s\n' "$(format_elapsed "$(( SECONDS - START_TIME ))")"
