@@ -54,6 +54,8 @@ Options:
   --skip-exts EXT[,EXT,...]   Skip these extensions, e.g. mp4,mkv
   --dry-run                   Show estimated savings per type, make no changes
   --skip-copy                 Skip rsync step; optimize an already-copied directory
+  --resume                    Resume interrupted optimization of DEST_DIR
+                              (implies --skip-copy; use the same --level as the original run)
   --copy-dupes DIR            Find duplicate files and copy redundant ones to DIR
   --delete-dupes              Find duplicate files and delete redundant ones (asks confirmation)
   --log FILE                  Append all output to FILE and terminal
@@ -100,6 +102,7 @@ Examples:
   media_optimize.sh --skip-exts mp4,mkv /media/usb/Photos
   media_optimize.sh --log ~/opt.log --jobs 4 /media/usb/Photos
   media_optimize.sh --skip-copy --level aggressive /media/usb/Photos_aggressive
+  media_optimize.sh --resume --level aggressive /media/usb/Photos_aggressive
   media_optimize.sh --copy-dupes /tmp/dupes_review /media/usb/Photos
   media_optimize.sh --delete-dupes /media/usb/Photos
 EOF
@@ -206,6 +209,8 @@ trap cleanup EXIT INT TERM
 
 # ── Parallel pool ─────────────────────────────────────────────────────────────
 PARALLEL_JOBS=1
+PROGRESS_FILE=""   # path to resume progress file; empty = no tracking
+RESUME=0           # 1 when --resume was passed
 wait_for_slot() {
     while (( $(jobs -rp | wc -l) >= PARALLEL_JOBS )); do
         wait -n 2>/dev/null || sleep 0.05
@@ -278,11 +283,14 @@ optimize_photo() {
             mv "$tmp" "$dst"
             [[ "$file" != "$dst" ]] && rm -f "$file"
             printf 'photo|%s|%d|%d\n' "$rel" "$sz_before" "$sz_after" > "$stats_file"
+            local _pout; [[ "$ext" == png ]] && _pout="${rel%.*}.jpg" || _pout="$rel"
+            [[ -n "$PROGRESS_FILE" ]] && printf '%s\n' "$_pout" >> "$PROGRESS_FILE"
             return
         fi
     fi
     rm -f "$tmp"
     printf 'photo|%s|%d|%d\n' "$rel" "$sz_before" "$sz_before" > "$stats_file"
+    [[ -n "$PROGRESS_FILE" ]] && printf '%s\n' "$rel" >> "$PROGRESS_FILE"
 }
 
 # Convert video → MP4. Renames if source is not .mp4. Writes result to $stats_file.
@@ -317,11 +325,14 @@ convert_video() {
             mv "$tmp" "$dst"
             [[ "$file" != "$dst" ]] && rm -f "$file"
             printf 'video|%s|%d|%d\n' "$rel" "$sz_before" "$sz_after" > "$stats_file"
+            local _vout; [[ "$ext" == mp4 ]] && _vout="$rel" || _vout="${rel%.*}.mp4"
+            [[ -n "$PROGRESS_FILE" ]] && printf '%s\n' "$_vout" >> "$PROGRESS_FILE"
             return
         fi
     fi
     rm -f "$tmp"
     printf 'video|%s|%d|%d|fail\n' "$rel" "$sz_before" "$sz_before" > "$stats_file"
+    # Note: failed videos are NOT recorded in PROGRESS_FILE so they are retried on --resume
 }
 
 # ── Top-savings report ────────────────────────────────────────────────────────
@@ -406,6 +417,18 @@ run_optimization() {
     local -a skipped_vid=() skipped_vid_sizes=()
     collect_media_files "$dest"
 
+    # Set up progress tracking for resume support
+    PROGRESS_FILE="$dest/.optimize_progress"
+    declare -A _done_files=()
+    if (( RESUME )) && [[ -f "$PROGRESS_FILE" ]]; then
+        local _line
+        while IFS= read -r _line; do
+            [[ -n "$_line" ]] && _done_files["$_line"]=1
+        done < "$PROGRESS_FILE"
+        printf 'Resuming: skipping %d already-processed files.\n' "${#_done_files[@]}"
+        echo
+    fi
+
     printf 'Found: %d photos, %d videos to process\n' \
         "${#img_files[@]}" "$(( ${#video_primary[@]} + ${#video_other[@]} ))"
     echo
@@ -417,6 +440,12 @@ run_optimization() {
         for file in "${img_files[@]}"; do
             (( ++idx ))
             local rel="${file#$dest/}"
+            local _pext="${file##*.}"; _pext="${_pext,,}"
+            local _rel_out; [[ "$_pext" == png ]] && _rel_out="${rel%.*}.jpg" || _rel_out="$rel"
+            if [[ -n "${_done_files[$_rel_out]+x}" ]]; then
+                printf '[%d/%d] [SKIP] %s\n' "$idx" "${#img_files[@]}" "$rel"
+                continue
+            fi
             printf '[%d/%d] %s\n' "$idx" "${#img_files[@]}" "$rel"
             local sf="$STATS_DIR/photo_${idx}.result"
             wait_for_slot
@@ -435,6 +464,12 @@ run_optimization() {
         for file in "${all_videos[@]}"; do
             (( ++idx ))
             local rel="${file#$dest/}"
+            local _vext="${file##*.}"; _vext="${_vext,,}"
+            local _rel_out; [[ "$_vext" == mp4 ]] && _rel_out="$rel" || _rel_out="${rel%.*}.mp4"
+            if [[ -n "${_done_files[$_rel_out]+x}" ]]; then
+                printf '[%d/%d] [SKIP] %s\n' "$idx" "${#all_videos[@]}" "$rel"
+                continue
+            fi
             local sz; sz=$(stat -c%s -- "$file")
             printf '[%d/%d] %s  (%s)\n' "$idx" "${#all_videos[@]}" "$rel" "$(format_bytes "$sz")"
             local sf="$STATS_DIR/video_${idx}.result"
@@ -680,6 +715,7 @@ main() {
     local level="moderate"
     local dry_run=0
     local skip_copy=0
+    local resume=0
     local log_file=""
     local positional=()
     local ov_jpeg_quality="" ov_img_max_dim=""
@@ -692,6 +728,7 @@ main() {
             -h|--help)           usage; exit 0 ;;
             --dry-run)           dry_run=1; shift ;;
             --skip-copy)         skip_copy=1; shift ;;
+            --resume)            resume=1; shift ;;
             --copy-dupes)        [[ $# -ge 2 ]] || fail "--copy-dupes requires a directory"; copy_dupes_dir="$2"; shift 2 ;;
             --copy-dupes=*)      copy_dupes_dir="${1#--copy-dupes=}"; shift ;;
             --delete-dupes)      delete_dupes=1; shift ;;
@@ -816,6 +853,10 @@ main() {
         *) fail "--preset must be: ultrafast superfast veryfast faster fast medium slow slower veryslow" ;;
     esac
 
+    # --resume implies --skip-copy
+    (( resume )) && skip_copy=1
+    RESUME="$resume"
+
     local source_dir dest_dir
     if (( skip_copy )) && [[ ${#positional[@]} -eq 1 ]]; then
         # --skip-copy with one arg: that arg IS the directory to optimize in-place
@@ -838,6 +879,12 @@ main() {
     local src_abs dest_abs
     src_abs="$(abs_path "$source_dir")"
     dest_abs="$(abs_path "$dest_dir")"
+
+    if [[ -f "$dest_abs/.optimize_progress" ]] && (( ! resume )); then
+        echo "Warning: '$dest_abs/.optimize_progress' found — a previous run may have been interrupted."
+        echo "         Run with --resume to continue from where it stopped."
+        echo
+    fi
 
     if (( ! skip_copy )); then
         require_command rsync
@@ -896,6 +943,9 @@ main() {
     local elapsed=$(( SECONDS - START_TIME ))
     print_summary "$STATS_DIR" "$elapsed"
     print_top_savings "$STATS_DIR"
+
+    # Remove progress file — all files processed successfully
+    [[ -n "$PROGRESS_FILE" && -f "$PROGRESS_FILE" ]] && rm -f "$PROGRESS_FILE"
 
     echo
     echo "Done."

@@ -49,7 +49,10 @@ After optimization finishes, folder statistics are automatically printed for bot
 # Preview estimated savings without making changes
 ./run.sh optimize --dry-run --level aggressive /media/usb/Photos
 
-# Continue after interrupted run (skip rsync, re-run optimization only)
+# Resume an interrupted optimization (skip already-processed files)
+./run.sh optimize --resume --level aggressive /media/usb/Photos_aggressive
+
+# Skip rsync and re-optimize an already-copied directory from scratch
 ./run.sh optimize --skip-copy --level aggressive /media/usb/Photos_aggressive
 
 # Process only specific formats
@@ -81,6 +84,8 @@ After optimization finishes, folder statistics are automatically printed for bot
 --skip-exts EXT[,EXT,...]      Skip these extensions, e.g. mp4,mkv,avi
 --dry-run                      Show estimated savings per type, make no changes
 --skip-copy                    Skip rsync; optimize an already-copied directory
+--resume                       Resume an interrupted optimization of DEST_DIR
+                               (implies --skip-copy; use the same --level as the original run)
 --log FILE                     Write output to file + terminal
 --jobs N                       Parallel workers for photo/video (default: 1)
 
@@ -237,7 +242,24 @@ Archive-level: near-lossless quality, just get rid of MOV format for compatibili
 
 ---
 
-### Scenario 6 — Large family archive, process folder by folder
+### Scenario 6 — Optimization was interrupted, continue from where it stopped
+
+The copy is already there but optimization was cut short (Ctrl+C, power loss, disk full, etc.).
+
+```bash
+# Check what's already been processed
+cat /media/usb/Photos_aggressive/.optimize_progress | wc -l
+
+# Resume — already-processed files are skipped, the rest continue
+./run.sh optimize --resume --level aggressive /media/usb/Photos_aggressive
+```
+
+> `.optimize_progress` is deleted automatically when optimization finishes successfully.
+> If you restart without `--resume` the script will warn you that the file exists.
+
+---
+
+### Scenario 7 — Large family archive, process folder by folder
 
 The archive is huge. Process one year at a time to be safe.
 
@@ -246,6 +268,8 @@ for year in /media/usb/Archive/20*/; do
     ./run.sh optimize --level aggressive --log ~/opt.log "$year"
 done
 ```
+
+> If a yearly run gets interrupted, resume it with `--resume` before moving to the next folder.
 
 ---
 
