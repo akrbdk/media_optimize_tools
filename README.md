@@ -18,7 +18,7 @@ The destination folder is named automatically: `SOURCE_DIR_<level>` (e.g. `Photo
 
 **Formats processed:**
 
-- MOV → MP4 H.264 + AAC (always — plays everywhere)
+- MOV, VOB → MP4 H.264 + AAC (always — plays everywhere)
 - JPEG, WEBP → recompressed, EXIF preserved (date, GPS, camera)
 - PNG → converted to JPEG, EXIF preserved (much smaller than lossless PNG)
 - MP4/MKV/AVI → re-encoded at `moderate`, `aggressive`, `maximum`
@@ -31,7 +31,7 @@ After optimization finishes, folder statistics are automatically printed for bot
 |----------------|-----------------|----------------------|-------------------------|------------------------|
 | JPEG/PNG quality | 95            | 88                   | 80                      | 70                     |
 | Max photo size | no limit        | 8000px               | 3840px                  | 2560px                 |
-| MOV → MP4      | CRF 20, 4K slow | CRF 25, 4K           | CRF 28, 1080p           | CRF 32, 720p           |
+| MOV/VOB → MP4  | CRF 20, 4K slow | CRF 25, 4K           | CRF 28, 1080p           | CRF 32, 720p           |
 | MP4/MKV/AVI    | skip            | re-encode CRF 25, 4K | re-encode CRF 28, 1080p | re-encode CRF 32, 720p |
 
 ### Examples
@@ -100,7 +100,7 @@ Quality overrides (applied on top of --level):
 
 Size filters (skip files already small enough):
 --min-photo-mb N      Skip photos smaller than N MB
---min-video-mb N      Skip videos/MOV smaller than N MB
+--min-video-mb N      Skip videos/MOV/VOB smaller than N MB
 ```
 
 ---
@@ -122,6 +122,9 @@ Run this before `optimize` to understand what's taking up space and what needs c
 # Custom thresholds for problematic files
 ./run.sh stats --photo-mb 2 --video-mb 50 /media/usb/Photos
 
+# Per-subdirectory summary: size and file count, sorted alphabetically
+./run.sh stats --subdirs /media/usb/Photos
+
 # Save output to file
 ./run.sh stats --log ~/stats.log /media/usb/Photos
 ```
@@ -134,6 +137,8 @@ Run this before `optimize` to understand what's taking up space and what needs c
 | `--top-files K`   | `50`    | Number of largest files to list                          |
 | `--photo-mb N`    | `4`     | Flag photos larger than N MB as needing compression      |
 | `--video-mb N`    | `80`    | Flag videos larger than N MB as needing compression      |
+| `--dupes`         | off     | Find duplicate files by content hash (requires python3)  |
+| `--subdirs`       | off     | Per-subdirectory summary: size and file count            |
 | `--log FILE`      | off     | Append all output to FILE in addition to the terminal    |
 
 Environment overrides: `FOLDER_STATS_DEPTH`, `FOLDER_STATS_TOP_FILES`, `FOLDER_STATS_PHOTO_MB`, `FOLDER_STATS_VIDEO_MB`.
@@ -242,6 +247,20 @@ Archive-level: near-lossless quality, just get rid of MOV format for compatibili
 
 ---
 
+### Scenario 5a — Convert DVD VOB files to MP4
+
+VOB files from DVD rips are always converted to MP4 (same as MOV).
+
+```bash
+# Convert VOB files at archive quality (near-lossless)
+./run.sh optimize --level archive --only-exts vob /media/usb/DVD_backup
+
+# Or together with MOV in one pass
+./run.sh optimize --level moderate --only-exts mov,vob /media/usb/HomeVideos
+```
+
+---
+
 ### Scenario 6 — Optimization was interrupted, continue from where it stopped
 
 The copy is already there but optimization was cut short (Ctrl+C, power loss, disk full, etc.).
@@ -338,10 +357,10 @@ sudo apt install rsync python3 imagemagick ffmpeg
 | `rsync`       | Copying source → destination          |
 | `python3`     | Dry-run size estimates                |
 | `imagemagick` | JPEG/PNG/WEBP photo optimization      |
-| `ffmpeg`      | MOV→MP4 conversion, video re-encoding |
+| `ffmpeg`      | MOV/VOB→MP4 conversion, video re-encoding |
 
-**Note:** `ffmpeg` is only needed if your archive contains video files (MOV, MP4, MKV, etc.).
-If you only have photos, skip it and use `--skip-exts mov` or `--only-exts jpg,jpeg,png`:
+**Note:** `ffmpeg` is only needed if your archive contains video files (MOV, VOB, MP4, MKV, etc.).
+If you only have photos, skip it and use `--skip-exts mov,vob` or `--only-exts jpg,jpeg,png`:
 
 ```bash
 ./run.sh optimize --only-exts jpg,jpeg,png /media/usb/Photos

@@ -8,7 +8,7 @@
 #   3. Prints a savings report with top files
 #
 # Supported formats:
-#   MOV        → MP4 H.264 + AAC (always — plays everywhere)
+#   MOV / VOB  → MP4 H.264 + AAC (always — plays everywhere)
 #   JPEG/WEBP  → recompressed (strip EXIF, slightly lower quality)
 #   PNG        → lossless recompression (strip EXIF)
 #   MP4/MKV/AVI/etc → re-encoded at levels aggressive and maximum
@@ -63,7 +63,7 @@ Options:
   -h, --help                  Show this help
 
 Levels (--level):
-  archive    Near-lossless. Only converts formats (MOV→MP4).
+  archive    Near-lossless. Only converts formats (MOV/VOB→MP4).
              JPEG 95, no resize, CRF 18 slow 4K. Good for precious originals.
 
   moderate   Safe optimization. Loss barely noticeable. (default)
@@ -92,7 +92,7 @@ Quality overrides (applied on top of --level, for fine-tuning):
   --max-height N       Downscale video if taller than N px
   --audio-bitrate VAL  AAC bitrate e.g. 128k 192k 256k
   --min-photo-mb N     Skip photos already smaller than N MB
-  --min-video-mb N     Skip videos/MOV already smaller than N MB
+  --min-video-mb N     Skip videos/MOV/VOB already smaller than N MB
 
 Examples:
   media_optimize.sh /media/usb/Photos
@@ -239,7 +239,7 @@ collect_media_files() {
             jpg|jpeg|png|webp)
                 (( MIN_PHOTO_BYTES > 0 && _sz < MIN_PHOTO_BYTES )) && continue
                 img_files+=("$_path"); img_sizes+=("$_sz") ;;
-            mov)
+            mov|vob)
                 (( MIN_VIDEO_BYTES > 0 && _sz < MIN_VIDEO_BYTES )) && continue
                 video_primary+=("$_path"); video_primary_sizes+=("$_sz") ;;
             mp4|mkv|avi|m4v|webm|mpg|mpeg)
@@ -538,7 +538,7 @@ PY
         "$(format_bytes "$img_sz")" "$(format_bytes "$img_est")" \
         "$(format_percent "$img_sz" "$img_est")"
     printf '%-10s  %5s files  %12s → %12s  ~%s\n' \
-        "MOV→MP4" "$(( ${#video_primary[@]} + ${#video_other[@]} ))" \
+        "MOV/VOB→MP4" "$(( ${#video_primary[@]} + ${#video_other[@]} ))" \
         "$(format_bytes "$vid_sz")" "$(format_bytes "$vid_est")" \
         "$(format_percent "$vid_sz" "$vid_est")"
     if (( REENCODE_ALL_VIDEO && other_sz > 0 )); then

@@ -20,6 +20,7 @@ Options:
   --photo-mb N        Flag photos larger than N MB (default: 4)
   --video-mb N        Flag videos larger than N MB (default: 80)
   --dupes             Find duplicate files by content hash (requires python3)
+  --subdirs           Show per-subdirectory summary: size and file count
   --log FILE          Append all output to FILE in addition to the terminal
   -h, --help          Show this help
 EOF
@@ -203,6 +204,41 @@ PY
     rm -f "$tmp_dupes"
 }
 
+print_subdirs_summary() {
+    local target="$1"
+    echo
+    echo "Subdirectory summary (size / file count):"
+    echo
+
+    local tmp_out
+    tmp_out=$(mktemp)
+
+    while IFS= read -r -d '' d; do
+        local size count
+        size=$(du -sh "$d" 2>/dev/null | cut -f1)
+        count=$(find "$d" -type f | wc -l)
+        printf '%s\t%s\t%d files\n' "$d" "$size" "$count"
+    done < <(find "$target" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z) \
+        | sort > "$tmp_out"
+
+    if [[ ! -s "$tmp_out" ]]; then
+        echo "  No subdirectories found."
+        rm -f "$tmp_out"
+        return
+    fi
+
+    # Align columns
+    awk -F'\t' '{ printf "  %-50s  %6s  %s\n", $1, $2, $3 }' "$tmp_out"
+
+    local total_dirs total_files
+    total_dirs=$(wc -l < "$tmp_out")
+    total_files=$(awk -F'\t' '{ gsub(/ files$/, "", $3); sum += $3 } END { print sum+0 }' "$tmp_out")
+    echo
+    printf '  Directories: %d   Total files: %d\n' "$total_dirs" "$total_files"
+
+    rm -f "$tmp_out"
+}
+
 print_largest_files() {
     local target="$1" limit="$2" photo_mb="$3" video_mb="$4"
     local photo_bytes=$(( photo_mb * 1024 * 1024 ))
@@ -233,6 +269,7 @@ main() {
     local log_file=""
     local target_dir=""
     local show_dupes=0
+    local show_subdirs=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -240,6 +277,8 @@ main() {
                 usage; exit 0 ;;
             --dupes)
                 show_dupes=1; shift ;;
+            --subdirs)
+                show_subdirs=1; shift ;;
             --depth)
                 [[ $# -ge 2 ]] || fail "--depth requires a value"
                 depth="$2"; shift 2 ;;
@@ -295,7 +334,8 @@ main() {
     print_directory_usage "$target_dir" "$depth"
     print_largest_files "$target_dir" "$top_files" "$photo_mb" "$video_mb"
     print_problematic_files "$target_dir" "$photo_mb" "$video_mb"
-    (( show_dupes )) && print_duplicate_stats "$target_dir"
+    (( show_dupes ))   && print_duplicate_stats "$target_dir"
+    (( show_subdirs )) && print_subdirs_summary "$target_dir"
 
     echo
     printf 'Elapsed: %s\n' "$(format_elapsed "$(( SECONDS - START_TIME ))")"
