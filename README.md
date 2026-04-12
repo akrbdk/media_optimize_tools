@@ -149,15 +149,94 @@ Environment overrides: `FOLDER_STATS_DEPTH`, `FOLDER_STATS_TOP_FILES`, `FOLDER_S
 Files that need aggressive compression:
   Photos > 4 MB | Videos/MOV > 80 MB | All MOV (need conversion)
 
-  [photo   8.3 MB]  TANYA/3 лето/IMG_5466.jpg
-  [photo   6.1 MB]  TANYA/2 весна/IMG_3842.jpg
-  [MOV   312.4 MB]  TANYA/1 зима/IMG_0877.MOV
-  [video  145.1 MB]  TANYA/2 весна/long_video.mp4
+  [photo   8.3 MB]  USER/3/IMG_5466.jpg
+  [photo   6.1 MB]  USER/2/IMG_3842.jpg
+  [MOV   312.4 MB]  USER/1/IMG_0877.MOV
+  [video  145.1 MB]  USER/2/long_video.mp4
 
   Large photos :  2 files   14.4 MB
   MOV files    :  1 files  312.4 MB
   Large videos :  1 files  145.1 MB
   Total        :  4 files  471.9 MB
+```
+
+---
+
+## Working with duplicates
+
+There are two separate tools for finding and removing duplicate files.
+
+### `stats --dupes` — view only
+
+Finds duplicates and shows statistics. **Makes no changes.**
+
+```bash
+./run.sh stats --dupes /media/usb/Photos
+```
+
+**How it works:** groups files by size first (fast), then computes MD5 only for files
+that share a size. Within each duplicate group the file with the alphabetically
+first path is treated as the "original"; the rest are reported as redundant.
+
+Example output:
+
+```
+Duplicate files (by content hash):
+  [dup]  backup/IMG_001.jpg
+  [dup]  2023/copy/IMG_001.jpg
+
+  Duplicate groups : 3
+  Redundant files  : 5
+  Wasted space     : 214.3 MB
+```
+
+### `optimize --copy-dupes` + `--delete-dupes` — manage duplicates
+
+These options work **independently of optimization** — no copying or compression,
+only duplicate detection and removal.
+
+#### Safe workflow: review before deleting
+
+```bash
+# Step 1 — copy redundant files to a separate folder for review
+./run.sh optimize --copy-dupes /tmp/dupes_review /media/usb/Photos
+# Copied 5 redundant files to: /tmp/dupes_review
+# Review them manually, then use --delete-dupes to remove from the original.
+
+# Step 2 — inspect what was found
+ls /tmp/dupes_review
+
+# Step 3 — if everything looks correct, delete from the original
+./run.sh optimize --delete-dupes /media/usb/Photos
+```
+
+#### Direct deletion (with confirmation prompt)
+
+```bash
+./run.sh optimize --delete-dupes /media/usb/Photos
+```
+
+The script lists all files to be deleted with their sizes and asks `[y/N]`.
+Nothing is deleted unless you type `y`.
+
+### What counts as a duplicate
+
+- Files are compared **by content (MD5 hash)**, not by name or path.
+- Within each group of identical files the **first one alphabetically is kept**;
+  all others are considered redundant.
+- Files in different subdirectories are detected too.
+
+### Typical scenario: archive with years of backups
+
+```bash
+# Check the scale of the problem
+./run.sh stats --dupes /media/usb/Archive
+
+# Copy duplicates for review
+./run.sh optimize --copy-dupes ~/dupes_review /media/usb/Archive
+
+# After reviewing, delete from the original
+./run.sh optimize --delete-dupes /media/usb/Archive
 ```
 
 ---
